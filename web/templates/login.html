@@ -1,0 +1,15 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>登录</h2>
+<form method="post">
+  <label>用户名</label>
+  <input type="text" name="username" />
+  <label>密码</label>
+  <input type="password" name="password" />
+  <div class="actions">
+    <button class="btn" type="submit">登录</button>
+    <a class="btn" href="{{ url_for('register') }}">注册</a>
+  </div>
+  <p>测试提示：首次使用请先注册。</p>
+{% endblock %}
+

@@ -120,5 +120,41 @@ python scripts/fund_flow.py 600519 --date 2025-09-12 --use-proxy
 
 ```
 python scripts/fund_flow.py 600519 --date 2025-09-12 --timeout 15
+
+多用户 Web（登录 + 自定义股票 + 每用户 RSS）
+
+- 启动服务（默认 8000 端口）：
+
+```
+python web/app.py
+```
+
+- 功能：
+  - 注册/登录，管理“我的股票”列表（每行“名称=代码”或直接“代码”，如 000981.SZ）
+  - 为每个用户生成专属 RSS 链接：`/u/<rss_token>.rss`
+  - RSS 内容包含：最新价、涨跌幅、总市值（亿元）以及主力/超大单/大单/中单/小单（亿元）
+
+- 注意：
+  - Web 监听端口为 `18888`（可通过反向代理映射到域名）。
+  - 外部 RSS 链接格式：`https://stock.cuixiaoyuan.cn/<RSS_PREFIX>/<rsstoken>.rss`
+    - 默认 `<RSS_PREFIX>` 为“用户名”；示例：`https://stock.cuixiaoyuan.cn/alice/<rsstoken>.rss`
+    - 可通过环境变量覆盖：`PUBLIC_DOMAIN=stock.cuixiaoyuan.cn`、`RSS_PREFIX=username|<自定义固定前缀>`
+    - 本地调试链接：`/u/<rsstoken>.rss` 或 `/<RSS_PREFIX>/<rsstoken>.rss`
+  - 重置 Token：在“我的股票”页面可一键重置 RSS Token；旧链接即刻失效。
+  - 更安全的 Token 模式（只显示一次 + 存哈希）：设置环境变量 `RSS_TOKEN_HASH_ONLY=true`；
+    - 注册或“重置”时会显示一次 Token，数据库仅存哈希；页面不再展示明文 Token。
+    - 丢失后只能再次重置。
+
+Cloudflare Zero Trust（不暴露端口）
+
+- 使用 Cloudflare Tunnel 将公网域名流量转发到本机 `127.0.0.1:18888`，无需在服务器上开放入站端口。
+- 简要步骤：
+  1. 在 Cloudflare Zero Trust 后台创建 Tunnel（cloudflared），绑定域名 `stock.cuixiaoyuan.cn`。
+  2. 添加一条 Public Hostname：
+     - Hostname: `stock.cuixiaoyuan.cn`
+     - Service: `http://127.0.0.1:18888`
+  3. 部署 cloudflared 守护进程（systemd）以保持隧道常驻。
+  4. 可按需为 `/*` 或 `/*/*.rss` 路径设置访问策略（如仅允许特定国家/频率限制等）。
+  - RSS 是公开令牌链接，建议妥善保存；如需失效可在数据库中手工更换 `users.rss_token`。
 ```
 观察股票的资金流入情况以及其他指标，抓涨停板

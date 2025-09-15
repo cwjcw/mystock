@@ -1,0 +1,14 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>注册</h2>
+<form method="post">
+  <label>用户名</label>
+  <input type="text" name="username" />
+  <label>密码</label>
+  <input type="password" name="password" />
+  <div class="actions">
+    <button class="btn" type="submit">注册</button>
+    <a class="btn" href="{{ url_for('login') }}">返回登录</a>
+  </div>
+{% endblock %}
+

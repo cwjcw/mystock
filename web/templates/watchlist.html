@@ -1,0 +1,33 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>我的股票</h2>
+<form method="post">
+  <label>每行一个；支持 “名称=代码” 或直接输入6位代码（自动识别沪/深）。</label>
+  <small>示例：<code>000981</code>（自动转为 <code>000981.SZ</code>），或 <code>山子高科=000981</code>。多个股票请换行输入。</small>
+  <textarea name="symbols" placeholder="000981
+山子高科=000981
+300661">{{ symbols_text }}</textarea>
+  <div class="actions">
+    <button class="btn" type="submit">保存</button>
+  </div>
+  <p>多个股票请换行输入，每行一个。</p>
+</form>
+
+<h3>我的 RSS</h3>
+<p>将此地址加入 RSS 阅读器：</p>
+<p>
+  {% if hash_only %}
+    <em>为安全起见，已隐藏 Token。请点击下方“重置RSS Token”生成新的 Token（只显示一次）。</em>
+  {% else %}
+    推荐外部域名： <code>https://{{ public_domain }}/{{ rss_prefix }}/{{ rss_token }}.rss</code>
+  {% endif %}
+</p>
+
+<form method="post" action="{{ url_for('reset_token') }}">
+  <button class="btn" type="submit">重置 RSS Token</button>
+  <small>重置后旧链接会失效。</small>
+  {% if hash_only %}
+    <div class="flash">重置后会显示一次新的 Token，请妥善保存。</div>
+  {% endif %}
+</form>
+{% endblock %}
