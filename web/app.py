@@ -60,6 +60,8 @@ if ENV_FILE.exists():
 PUBLIC_DOMAIN = os.environ.get('PUBLIC_DOMAIN', PUBLIC_DOMAIN)
 RSS_PREFIX = os.environ.get('RSS_PREFIX', RSS_PREFIX)
 RSS_TOKEN_HASH_ONLY = os.environ.get('RSS_TOKEN_HASH_ONLY', 'false').lower() in {'1', 'true', 'yes'}
+APP_PORT = int(os.environ.get('APP_PORT', '18888'))
+DEBUG_FLAG = os.environ.get('DEBUG', 'false').lower() in {'1', 'true', 'yes'}
 
 # Rate limit defaults: 1 request per 60 seconds
 RATE_LIMIT_REQUESTS = int(os.environ.get('RSS_RATE_LIMIT', '1'))  # requests per window
@@ -416,4 +418,4 @@ def prefixed_rss(prefix: str, token: str):
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=18888, debug=True)
+    app.run(host='0.0.0.0', port=APP_PORT, debug=DEBUG_FLAG)

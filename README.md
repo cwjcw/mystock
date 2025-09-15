@@ -92,6 +92,21 @@ RSS_TOKEN_HASH_ONLY=true
 # 限速：每窗口内允许的请求次数、窗口秒数（默认 1/60）
 RSS_RATE_LIMIT=1
 RSS_RATE_WINDOW=60
+
+# Web 服务端口与调试开关
+APP_PORT=18888
+DEBUG=false
+
+# Flask 会话密钥（强随机）
+# 生产环境务必使用强随机值（不要用示例/默认）。
+# 生成方法：
+# - 通用（Python）：
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+# - Linux/macOS：
+#   openssl rand -base64 32
+# - Windows PowerShell：
+#   [Convert]::ToBase64String((New-Object System.Security.Cryptography.RNGCryptoServiceProvider).GetBytes(32))
+SECRET_KEY=change-me-please
 ```
 
 ## Cloudflare Zero Trust（不暴露端口）

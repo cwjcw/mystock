@@ -208,3 +208,8 @@ __marimo__/
 *.db
 *.rss
 
+
+# Local env and temp files
+.env
+tmp_*
+
