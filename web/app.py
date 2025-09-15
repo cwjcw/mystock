@@ -1,6 +1,9 @@
 import os
 import secrets
 import hashlib
+import time
+import threading
+from collections import defaultdict, deque
 import sqlite3
 from pathlib import Path
 from typing import List, Dict
@@ -39,6 +42,47 @@ PUBLIC_DOMAIN = os.environ.get('PUBLIC_DOMAIN', 'stock.cuixiaoyuan.cn')
 # Otherwise, enforce a fixed prefix string
 RSS_PREFIX = os.environ.get('RSS_PREFIX', 'username')
 RSS_TOKEN_HASH_ONLY = os.environ.get('RSS_TOKEN_HASH_ONLY', 'false').lower() in {'1', 'true', 'yes'}
+
+# Load environment-style config from project root .env (KEY=VALUE), if present
+PROJECT_ROOT = APP_DIR.parent
+ENV_FILE = PROJECT_ROOT / '.env'
+if ENV_FILE.exists():
+    for line in ENV_FILE.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        os.environ[k.strip()] = v.strip()
+
+# Re-resolve settings (allow .env to override defaults)
+PUBLIC_DOMAIN = os.environ.get('PUBLIC_DOMAIN', PUBLIC_DOMAIN)
+RSS_PREFIX = os.environ.get('RSS_PREFIX', RSS_PREFIX)
+RSS_TOKEN_HASH_ONLY = os.environ.get('RSS_TOKEN_HASH_ONLY', 'false').lower() in {'1', 'true', 'yes'}
+
+# Rate limit defaults: 1 request per 60 seconds
+RATE_LIMIT_REQUESTS = int(os.environ.get('RSS_RATE_LIMIT', '1'))  # requests per window
+RATE_LIMIT_WINDOW = int(os.environ.get('RSS_RATE_WINDOW', '60'))   # seconds
+
+# Simple in-memory rate limiter: key -> deque[timestamps]
+_RL_LOCK = threading.Lock()
+_RL_BUCKETS: dict[str, deque] = defaultdict(deque)
+
+
+def _rate_check_and_consume(key: str):
+    """Return (ok: bool, retry_after: int)."""
+    now = time.time()
+    with _RL_LOCK:
+        q = _RL_BUCKETS[key]
+        # drop old
+        while q and (now - q[0]) > RATE_LIMIT_WINDOW:
+            q.popleft()
+        if len(q) >= RATE_LIMIT_REQUESTS:
+            retry = int(RATE_LIMIT_WINDOW - (now - q[0])) + 1
+            return False, max(retry, 1)
+        q.append(now)
+        return True, 0
 
 
 def get_db():
@@ -275,6 +319,20 @@ def _find_user_by_token(db, token: str):
 
 
 def generate_rss_response(token: str):
+    # Rate limit by IP and by token
+    ip_key = f"ip:{request.remote_addr or 'unknown'}"
+    ok, retry = _rate_check_and_consume(ip_key)
+    if not ok:
+        resp = make_response('Too Many Requests (IP)', 429)
+        resp.headers['Retry-After'] = str(retry)
+        return resp
+    tok_key = f"tok:{token}"
+    ok, retry = _rate_check_and_consume(tok_key)
+    if not ok:
+        resp = make_response('Too Many Requests (Token)', 429)
+        resp.headers['Retry-After'] = str(retry)
+        return resp
+
     db = get_db()
     row = _find_user_by_token(db, token)
     if not row:
