@@ -213,3 +213,10 @@ __marimo__/
 .env
 tmp_*
 
+# Local env and temp files
+.env
+tmp_*
+
+# Project data artifacts (do not version control)
+data/*.db
+data/*.rss
