@@ -89,15 +89,7 @@ async def fetch_quote_basic(session: aiohttp.ClientSession, secid: str) -> Optio
     return {"name": name, "price": price, "change_pct": change_pct, "market_cap": mcap}
 
 
-def is_trading_minutes(now: Optional[dt.datetime] = None) -> bool:
-    now = now or dt.datetime.now()
-    # Use local time; ensure weekdays
-    if now.weekday() >= 5:
-        return False
-    t = now.time()
-    am = (dt.time(9, 30) <= t <= dt.time(11, 30))
-    pm = (dt.time(13, 0) <= t <= dt.time(15, 0))
-    return am or pm
+
 
 
 def ensure_channel(tree: Optional[ET.ElementTree], title: str, link: str, desc: str) -> ET.ElementTree:
@@ -203,12 +195,14 @@ async def run_once(symbols: Dict[str, str], rss_path: str, use_proxy: bool = Fal
         #   中单 -> row['大单']
         #   小单 -> row['超大单']
         desc = (
-            f"最新价:{price_txt} 涨跌幅:{chg_txt} 总市值:{mcap_txt} | "
-            f"主力:{row['主力']} "
-            f"超大单:{row['小单']} "
-            f"大单:{row['中单']} "
-            f"中单:{row['大单']} "
-            f"小单:{row['超大单']} (单位:亿元)"
+            f"最新价: {price_txt}\n"
+            f"涨跌幅: {chg_txt}\n"
+            f"总市值: {mcap_txt}\n"
+            f"主力: {row['主力']} 亿元\n"
+            f"超大单: {row['小单']} 亿元\n"
+            f"大单: {row['中单']} 亿元\n"
+            f"中单: {row['大单']} 亿元\n"
+            f"小单: {row['超大单']} 亿元"
         )
         pub = now.strftime("%a, %d %b %Y %H:%M:%S %z")
         items.append({"guid": guid, "title": title, "description": desc, "pubDate": pub})
@@ -216,11 +210,7 @@ async def run_once(symbols: Dict[str, str], rss_path: str, use_proxy: bool = Fal
     append_items(Path(rss_path), items)
 
 
-async def run_scheduler(symbols: Dict[str, str], rss_path: str, interval_min: int = 10, use_proxy: bool = False):
-    while True:
-        if is_trading_minutes():
-            await run_once(symbols, rss_path, use_proxy=use_proxy)
-        await asyncio.sleep(interval_min * 60)
+
 
 
 def parse_pairs(pairs: List[str]) -> Dict[str, str]:
@@ -235,12 +225,10 @@ def parse_pairs(pairs: List[str]) -> Dict[str, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate/Update RSS with minute fund flows")
+    parser = argparse.ArgumentParser(description="一次性抓取并生成RSS（分钟资金流）")
     parser.add_argument("pairs", nargs="*", help="Name=Symbol or Symbol (e.g., 山子高科=000981.SZ)")
-    parser.add_argument("--rss", default="data/fund_flow.rss", help="RSS output path")
-    parser.add_argument("--interval", type=int, default=10, help="Interval minutes during trading time")
-    parser.add_argument("--use-proxy", action="store_true", help="Use system proxy")
-    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--rss", default="data/fund_flow.rss", help="RSS输出文件路径")
+    parser.add_argument("--use-proxy", action="store_true", help="使用系统代理")
     args = parser.parse_args()
 
     symbols = parse_pairs(args.pairs) if args.pairs else {
@@ -251,10 +239,7 @@ def main():
         "三博脑科": "301293.SZ",
     }
 
-    if args.once:
-        asyncio.run(run_once(symbols, args.rss, use_proxy=args.use_proxy))
-    else:
-        asyncio.run(run_scheduler(symbols, args.rss, interval_min=args.interval, use_proxy=args.use_proxy))
+    asyncio.run(run_once(symbols, args.rss, use_proxy=args.use_proxy))
 
 
 if __name__ == "__main__":

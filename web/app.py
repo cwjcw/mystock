@@ -300,9 +300,13 @@ def reset_token():
     db = get_db()
     token = secrets.token_urlsafe(24)
     token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    # 构造完整订阅链接
+    resolved_prefix = current_user.username if RSS_PREFIX == 'username' else RSS_PREFIX
+    rss_url = f"https://{PUBLIC_DOMAIN}/{resolved_prefix}/{token}.rss" if RSS_PREFIX else f"https://{PUBLIC_DOMAIN}/u/{token}.rss"
     if RSS_TOKEN_HASH_ONLY:
         db.execute('UPDATE users SET rss_token=NULL, rss_token_hash=? WHERE id=?', (token_hash, current_user.id))
         flash(f'新的RSS Token（只显示一次）：{token}', 'success')
+        flash(f'你的专属RSS订阅链接（只显示一次）：{rss_url}', 'success')
     else:
         db.execute('UPDATE users SET rss_token=?, rss_token_hash=NULL WHERE id=?', (token, current_user.id))
         flash('已重置RSS Token。', 'success')
@@ -359,13 +363,30 @@ def generate_rss_response(token: str):
             chg = q.get('change_pct') if q else None
             mcap = q.get('market_cap') if q else None
             mcap_yi = None if mcap is None else round(mcap/1e8, 2)
-            chg_txt = '-' if chg is None else f"{chg:.2f}%"
+            if chg is None or abs(chg) < 1e-8:
+                chg_txt = '-'
+            else:
+                chg_txt = f"{chg:.2f}%"
             price_txt = '-' if price is None else f"{price:.2f}"
             mcap_txt = '-' if mcap_yi is None else f"{mcap_yi:.2f}亿"
             # Apply user-requested label/value mapping for RSS
+            def color_num(val):
+                try:
+                    v = float(val)
+                except Exception:
+                    return f"<span>{val}</span>"
+                color = 'green' if v >= 0 else 'red'
+                return f'<span style="color:{color}">{v}</span>'
+
             desc = (
-                f"最新价:{price_txt} 涨跌幅:{chg_txt} 总市值:{mcap_txt} | "
-                f"主力:{rowd['主力']} 超大单:{rowd['小单']} 大单:{rowd['中单']} 中单:{rowd['大单']} 小单:{rowd['超大单']} (单位:亿元)"
+                f"最新价: {price_txt}<br>"
+                f"涨跌幅: {chg_txt}<br>"
+                f"总市值: {mcap_txt}<br>"
+                f"主力: {color_num(rowd['主力'])} 亿元<br>"
+                f"超大单: {color_num(rowd['小单'])} 亿元<br>"
+                f"大单: {color_num(rowd['中单'])} 亿元<br>"
+                f"中单: {color_num(rowd['大单'])} 亿元<br>"
+                f"小单: {color_num(rowd['超大单'])} 亿元"
             )
             item = {
                 'guid': f"{symbol}_{rowd['time']}",

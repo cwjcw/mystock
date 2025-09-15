@@ -71,7 +71,7 @@ python web/app.py
 - 使用说明：
   - 登录仅用于“配置股票/重置 token”；RSS 订阅无需登录
   - 在“我的股票”里：每行一个；可填“名称=代码”或直接 6 位代码（自动识别沪/深）
-  - 推荐外部 RSS 链接：`https://stock.cuixiaoyuan.cn/<RSS_PREFIX>/<rsstoken>.rss`
+  - 推荐外部 RSS 链接：`https://stock.yourdomin.cn/<RSS_PREFIX>/<rsstoken>.rss`
     - 默认 `<RSS_PREFIX>` 为“用户名”，可改为固定前缀（见 .env）
   - 本地调试：`/u/<rsstoken>.rss` 或 `/<RSS_PREFIX>/<rsstoken>.rss`
   - 重置 Token：页面一键重置；旧链接立即失效
@@ -82,7 +82,7 @@ python web/app.py
 启动时自动读取 `.env`（也可用进程环境变量覆盖），示例：
 ```
 # 外部域名与 RSS 路径前缀
-PUBLIC_DOMAIN=stock.cuixiaoyuan.cn
+PUBLIC_DOMAIN=stock.you r d o mian.cn
 # 使用用户名作为前缀：username；或指定固定前缀，如 rss
 RSS_PREFIX=username
 
@@ -110,7 +110,7 @@ SECRET_KEY=change-me-please
 ```
 
 ## Cloudflare Zero Trust（不暴露端口）
-- 用 Cloudflare Tunnel 将 `https://stock.cuixiaoyuan.cn` 流量转发到本机 `127.0.0.1:18888`；无需开放入站端口
+- 用 Cloudflare Tunnel 将 `https://stock.yourdomin.cn` 流量转发到本机 `127.0.0.1:18888`；无需开放入站端口
 - 在 Zero Trust 后台创建 Tunnel → 添加 Public Hostname（Service 指向 `http://127.0.0.1:18888`）→ 部署 cloudflared 常驻
 - 可对 `/*.rss` 路径配置访问策略/频控
 
