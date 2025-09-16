@@ -178,6 +178,11 @@ def _init_db(conn: sqlite3.Connection):
         )
         """
     )
+    cols = {row[1] for row in conn.execute('PRAGMA table_info("fund_flow_daily")')}
+    if "名称" not in cols:
+        conn.execute('ALTER TABLE fund_flow_daily ADD COLUMN "名称" TEXT')
+    if "总市值" not in cols:
+        conn.execute('ALTER TABLE fund_flow_daily ADD COLUMN "总市值" REAL')
 
 
 def save_to_sqlite(results: List[Dict], db_path: str):
@@ -226,6 +231,7 @@ def save_to_sqlite(results: List[Dict], db_path: str):
             # scale to 亿元 with 2 decimals
             def sc(x):
                 return round(float(x) / 1e8, 2) if x is not None else None
+            market_cap_scaled = sc(r.get("market_cap"))
             flow_rows.append(
                 (
                     r.get("code"),
@@ -237,21 +243,25 @@ def save_to_sqlite(results: List[Dict], db_path: str):
                     sc(r.get("medium")),
                     sc(r.get("small")),
                     r.get("change_pct"),
+                    r.get("name"),
+                    market_cap_scaled,
                 )
             )
         if flow_rows:
             conn.executemany(
                 """
                 INSERT INTO fund_flow_daily (
-                    "代码","交易所","日期","主力","超大单","大单","中单","小单","涨跌幅"
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "代码","交易所","日期","主力","超大单","大单","中单","小单","涨跌幅","名称","总市值"
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT("代码","交易所","日期") DO UPDATE SET
                     "主力"=excluded."主力",
                     "超大单"=excluded."超大单",
                     "大单"=excluded."大单",
                     "中单"=excluded."中单",
                     "小单"=excluded."小单",
-                    "涨跌幅"=excluded."涨跌幅"
+                    "涨跌幅"=excluded."涨跌幅",
+                    "名称"=excluded."名称",
+                    "总市值"=excluded."总市值"
                 """,
                 flow_rows,
             )

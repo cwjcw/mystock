@@ -1,0 +1,114 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>盈亏概览与持仓</h2>
+<form method="get" class="pnl-form range">
+  <label for="start">开始日期</label>
+  <input id="start" name="start" type="date" value="{{ start_date }}">
+  <label for="end">结束日期</label>
+  <input id="end" name="end" type="date" value="{{ end_date }}">
+  <div class="actions">
+    <button class="btn" type="submit">重新计算</button>
+  </div>
+</form>
+
+<section class="profit-summary">
+  <div class="profit-card small">
+    <h3>周期已实现盈亏</h3>
+    <p class="profit-value {{ 'profit-positive' if realized_with_initial > 0 else 'profit-negative' if realized_with_initial < 0 else '' }}">{{ '%.2f'|format(realized_with_initial) }} 元</p>
+  </div>
+  <div class="profit-card small">
+    <h3>当前持仓盈亏</h3>
+    <p class="profit-value {{ 'profit-positive' if unrealized_total > 0 else 'profit-negative' if unrealized_total < 0 else '' }}">{{ '%.2f'|format(unrealized_total) }} 元</p>
+    <p>持仓总成本：{{ '%.2f'|format(total_cost_basis) }} 元</p>
+    <p>持仓市值：{{ '%.2f'|format(total_market_value) }} 元</p>
+  </div>
+  <div class="profit-card small">
+    <h3>当日盈亏</h3>
+    <p class="profit-value {{ 'profit-positive' if daily_total > 0 else 'profit-negative' if daily_total < 0 else '' }}">{{ '%.2f'|format(daily_total) }} 元</p>
+    <p class="muted">股票：{{ '%.2f'|format(daily_stock_pnl) }} 元；基金：{{ '%.2f'|format(daily_fund_pnl) }} 元</p>
+  </div>
+  <div class="profit-card small">
+    <h3>总盈亏</h3>
+    <p class="profit-value {{ 'profit-positive' if combined_total > 0 else 'profit-negative' if combined_total < 0 else '' }}">{{ '%.2f'|format(combined_total) }} 元</p>
+    <p class="muted">= 周期已实现（含初始） + 持仓盈亏</p>
+  </div>
+</section>
+
+<section class="initial-profit">
+  <h3>初始盈利记录</h3>
+  <form method="post" action="{{ url_for('add_initial_profit') }}" class="initial-form">
+    <label for="init_amount">金额</label>
+    <input id="init_amount" name="amount" type="number" step="0.01" required>
+    <label for="init_note">备注</label>
+    <input id="init_note" name="note" type="text" placeholder="可选">
+    <div class="actions">
+      <button class="btn" type="submit">新增初始盈利</button>
+    </div>
+    <p class="muted">日期固定为今日：{{ today_str }}</p>
+  </form>
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>日期</th>
+        <th>金额</th>
+        <th>备注</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in initial_profits %}
+        <tr>
+          <td>{{ item['profit_date'] }}</td>
+          <td class="{{ 'profit-positive' if item['amount'] > 0 else 'profit-negative' if item['amount'] < 0 else '' }}">{{ '%.2f'|format(item['amount']) }}</td>
+          <td>{{ item['note'] or '' }}</td>
+          <td>
+            <form method="post" action="{{ url_for('delete_initial_profit', profit_id=item['id']) }}" onsubmit="return confirm('确认删除该记录？');">
+              <button class="btn" type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr>
+          <td colspan="4">暂无初始盈利记录。</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="positions">
+  <h3>当前持仓</h3>
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+       <th>名称</th>
+       <th>数量</th>
+       <th>持仓成本</th>
+       <th>最新价</th>
+       <th>市值</th>
+       <th>持仓盈亏</th>
+        <th>持仓盈亏%</th>
+        <th>当日收益</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for pos in positions %}
+        <tr>
+          <td>{{ pos.name or pos.symbol }}</td>
+          <td>{{ '%.2f'|format(pos.quantity) }}</td>
+          <td>{{ '%.4f'|format(pos.avg_cost) }}</td>
+          <td>{{ '-' if pos.price is none else '%.4f'|format(pos.price) }}</td>
+          <td>{{ '-' if pos.market_value is none else '%.2f'|format(pos.market_value) }}</td>
+          <td class="{{ 'profit-positive' if pos.unrealized is not none and pos.unrealized > 0 else 'profit-negative' if pos.unrealized is not none and pos.unrealized < 0 else '' }}">{{ '-' if pos.unrealized is none else '%.2f'|format(pos.unrealized) }}</td>
+          <td class="{{ 'profit-positive' if pos.unrealized is not none and pos.unrealized > 0 else 'profit-negative' if pos.unrealized is not none and pos.unrealized < 0 else '' }}">{{ '-' if pos.unrealized is none or pos.cost_basis is none or pos.cost_basis == 0 else '%.1f'|format((pos.unrealized / pos.cost_basis) * 100) }}%</td>
+          <td class="{{ 'profit-positive' if pos.daily_change is not none and pos.daily_change > 0 else 'profit-negative' if pos.daily_change is not none and pos.daily_change < 0 else '' }}">{{ '-' if pos.daily_change is none else '%.2f'|format(pos.daily_change) }}</td>
+      </tr>
+      {% else %}
+        <tr>
+          <td colspan="8">暂无持仓。</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

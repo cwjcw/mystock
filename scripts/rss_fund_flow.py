@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import time
+import json
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -89,6 +91,73 @@ async def fetch_quote_basic(session: aiohttp.ClientSession, secid: str) -> Optio
     mcap = d.get("f116")  # RMB
     name = d.get("f58")
     return {"name": name, "price": price, "change_pct": change_pct, "market_cap": mcap}
+
+
+async def fetch_fund_quote(session: aiohttp.ClientSession, code: str) -> Optional[dict]:
+    """Fetch fund realtime estimate (GSZ) via jsonp endpoint."""
+    base = code.upper().split('.', 1)[0]
+    url = f"https://fundgz.1234567.com.cn/js/{base}.js"
+    headers = {
+        "Referer": "https://fund.eastmoney.com/",
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+            else:
+                text = ""
+    except Exception:
+        text = ""
+    text = text.strip()
+    if text.startswith("jsonpgz("):
+        payload = text[len("jsonpgz(") : -2]
+        try:
+            data = json.loads(payload)
+        except Exception:
+            data = None
+        if data:
+            name = data.get("name")
+            gsz = data.get("gsz")
+            nav = data.get("dwjz")
+            price = None
+            for candidate in (gsz, nav):
+                try:
+                    price = float(candidate)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            chg = data.get("gszzl")
+            try:
+                change_pct = float(chg)
+            except (TypeError, ValueError):
+                change_pct = None
+            return {"name": name, "price": price, "change_pct": change_pct, "market_cap": None}
+
+    # Fallback to pingzhongdata (daily NAV)
+    url = f"https://fund.eastmoney.com/pingzhongdata/{base}.js"
+    try:
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            js_text = await resp.text()
+    except Exception:
+        return None
+    name_match = re.search(r'var fS_name\s*=\s*"(.*?)";', js_text)
+    data_match = re.search(r"var Data_netWorthTrend\s*=\s*(\[.*?\]);", js_text)
+    if not data_match:
+        return None
+    try:
+        trend = json.loads(data_match.group(1))
+    except Exception:
+        return None
+    if not trend:
+        return None
+    latest = trend[-1]
+    price = latest.get('y')
+    change_pct = latest.get('equityReturn')
+    name = name_match.group(1) if name_match else None
+    return {"name": name, "price": price, "change_pct": change_pct, "market_cap": None}
 
 
 

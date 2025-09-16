@@ -1,5 +1,7 @@
 import argparse
 import datetime as dt
+import random
+import time
 from typing import List, Dict, Optional
 import requests
 
@@ -12,7 +14,14 @@ except ModuleNotFoundError:
     from fund_flow import fetch_fund_flow_dayk, fetch_basic_info, save_to_sqlite  # type: ignore
 
 
-EM_HEADERS = {"Referer": "https://quote.eastmoney.com/"}
+EM_HEADERS = {
+    "Referer": "https://quote.eastmoney.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36"
+    ),
+}
 SESSION = requests.Session()
 SESSION.trust_env = False
 
@@ -26,8 +35,17 @@ def fetch_all_stock_codes() -> List[str]:
             "https://push2.eastmoney.com/api/qt/clist/get?"
             f"pn={pn}&pz=500&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0,m:1&fields=f12"
         )
-        r = SESSION.get(url, headers=EM_HEADERS, timeout=10)
-        r.raise_for_status()
+        delay = 1.0
+        for attempt in range(5):
+            try:
+                r = SESSION.get(url, headers=EM_HEADERS, timeout=10)
+                r.raise_for_status()
+                break
+            except requests.RequestException:
+                if attempt == 4:
+                    raise
+                time.sleep(delay + random.uniform(0, 0.5))
+                delay = min(delay * 2, 8)
         j = r.json()
         data = (j.get("data") or {}).get("diff") or []
         if not data:

@@ -18,13 +18,46 @@
       .nav { margin-bottom:1rem; }
       .nav a { margin-right:1rem; }
       code { background:#f2f2f2; padding:.2rem .35rem; border-radius:3px; }
+      .trade-layout { display:flex; flex-wrap:wrap; gap:1.5rem; }
+      .trade-form.compact { flex:1 1 220px; display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:.4rem .75rem; align-items:end; padding:.75rem; border:1px solid #ddd; border-radius:6px; background:#fafafa; }
+      .trade-form .form-row { display:flex; flex-direction:column; gap:.25rem; }
+      .trade-form .form-row label { font-size:.8rem; color:#555; }
+      .trade-form .form-row.wide { grid-column:1 / -1; }
+      .trade-form .actions { grid-column:1 / -1; }
+      .trade-form.compact input, .trade-form.compact select { width:100%; }
+      .history { flex: 1 1 420px; }
+      .history table { width:100%; border-collapse:collapse; font-size:.85rem; }
+      .history th, .history td { text-align:center; }
+      .history-table td:nth-child(3), .history-table th:nth-child(3) { width:24%; }
+      .history-meta { display:flex; justify-content:space-between; align-items:center; margin-bottom:.5rem; }
+      .pagination { margin-top:.75rem; display:flex; gap:.75rem; align-items:center; }
+      .table-actions { display:flex; gap:.5rem; justify-content:center; }
+      .table-actions form { margin:0; }
+      .table-actions .btn { padding:.35rem .6rem; }
+      .pnl-form.range { display:flex; flex-wrap:wrap; gap:.5rem 1rem; align-items:flex-end; margin:1rem 0; }
+      .pnl-form.range label { font-size:.85rem; color:#555; }
+      .pnl-form.range input { padding:.4rem .5rem; }
+      .profit-summary { display:flex; flex-wrap:wrap; gap:1rem; margin-bottom:1.5rem; }
+      .profit-card { flex:1 1 220px; border:1px solid #ddd; border-radius:6px; padding:1rem; background:#fafafa; }
+      .profit-card.small { flex:1 1 200px; }
+      .profit-card ul { margin:.5rem 0 0 1rem; padding-left:0; }
+      .profit-card li { margin:.25rem 0; }
+      .profit-value { font-size:1.4rem; font-weight:600; margin:.25rem 0; }
+      .muted { color:#666; font-size:.9rem; }
+      .positions table { width:100%; border-collapse:collapse; }
+      .positions th, .positions td { text-align:center; }
+      .initial-profit { margin:1.5rem 0; }
+      .initial-form { display:flex; flex-wrap:wrap; gap:.5rem 1rem; align-items:flex-end; margin-bottom:.75rem; }
+      .initial-form label { font-size:.85rem; color:#555; }
+      .profit-positive { color:#1e7a1e; }
+      .profit-negative { color:#c62828; }
     </style>
   </head>
   <body>
     <div class="container">
       <div class="nav">
         {% if current_user.is_authenticated %}
-          你好，{{ current_user.username }} | <a href="{{ url_for('watchlist_view') }}">我的股票</a> | <a href="{{ url_for('logout') }}">退出</a>
+          你好，{{ current_user.username }} | <a href="{{ url_for('watchlist_view') }}">我的股票</a> | <a href="{{ url_for('trades_view') }}">交易记录</a> | <a href="{{ url_for('portfolio_view') }}">持仓与盈亏</a> | <a href="{{ url_for('logout') }}">退出</a>
         {% else %}
           <a href="{{ url_for('login') }}">登录</a> | <a href="{{ url_for('register') }}">注册</a>
         {% endif %}
@@ -36,4 +69,3 @@
     </div>
   </body>
   </html>
-

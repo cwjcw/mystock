@@ -3,12 +3,13 @@ import secrets
 import hashlib
 import time
 import threading
+import math
 from collections import defaultdict, deque
 import sqlite3
 from pathlib import Path
 from typing import List, Dict
 
-from flask import Flask, g, render_template, request, redirect, url_for, flash, make_response
+from flask import Flask, g, render_template, request, redirect, url_for, flash, make_response, abort
 from flask_login import (
     LoginManager,
     UserMixin,
@@ -21,11 +22,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 # Reuse fetchers from scripts for RSS
 try:
-    from scripts.rss_fund_flow import fetch_latest_minute, fetch_quote_basic, symbol_to_secid
+    from scripts.rss_fund_flow import fetch_latest_minute, fetch_quote_basic, fetch_fund_quote, symbol_to_secid
 except ModuleNotFoundError:
     import sys
     sys.path.append(str(Path(__file__).resolve().parents[1] / 'scripts'))
-    from rss_fund_flow import fetch_latest_minute, fetch_quote_basic, symbol_to_secid  # type: ignore
+    from rss_fund_flow import fetch_latest_minute, fetch_quote_basic, fetch_fund_quote, symbol_to_secid  # type: ignore
 
 import asyncio
 import aiohttp
@@ -122,6 +123,29 @@ def init_db():
             name TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
+        CREATE TABLE IF NOT EXISTS trade_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            trade_date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            price REAL NOT NULL,
+            fee REAL NOT NULL DEFAULT 0,
+            asset_type TEXT NOT NULL DEFAULT 'stock',
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS initial_profits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            profit_date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
         """
     )
     # Backfill schema if old DB exists without rss_token_hash
@@ -129,6 +153,9 @@ def init_db():
         cols = [r[1] for r in db.execute('PRAGMA table_info(users)').fetchall()]
         if 'rss_token_hash' not in cols:
             db.execute('ALTER TABLE users ADD COLUMN rss_token_hash TEXT')
+        trade_cols = [r[1] for r in db.execute('PRAGMA table_info(trade_logs)').fetchall()]
+        if 'asset_type' not in trade_cols:
+            db.execute("ALTER TABLE trade_logs ADD COLUMN asset_type TEXT NOT NULL DEFAULT 'stock'")
     except Exception:
         pass
     db.commit()
@@ -269,6 +296,125 @@ def _parse_symbols(text: str) -> List[Dict[str, str]]:
     return out
 
 
+def _normalize_trade_symbol(value: str, asset_type: str) -> str | None:
+    s = value.strip().upper()
+    if not s:
+        return None
+    if asset_type == 'fund':
+        if '.' not in s:
+            s += '.OF'
+        elif not s.endswith('.OF'):
+            base = s.split('.', 1)[0]
+            s = base + '.OF'
+        return s
+    # fallback to stock normalization
+    parsed = _parse_symbols(s)
+    return parsed[0]['symbol'] if parsed else None
+
+
+def _parse_iso_date(value: str | None) -> dt.date | None:
+    if not value:
+        return None
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: Dict[str, str]):
+    holdings: Dict[str, dict] = {}
+    realized_period: Dict[str, float] = defaultdict(float)
+    realized_total_period = 0.0
+    realized_all_time = 0.0
+
+    for row in rows:
+        symbol = row['symbol']
+        action = row['action']
+        quantity = float(row['quantity'])
+        price = float(row['price'])
+        fee = float(row['fee'] or 0.0)
+        trade_day = _parse_iso_date(row['trade_date']) or start_date
+        try:
+            asset_type = row['asset_type'] or 'stock'
+        except (KeyError, IndexError, TypeError):
+            asset_type = 'stock'
+
+        entry = holdings.setdefault(symbol, {'qty': 0.0, 'avg_cost': 0.0, 'asset_type': asset_type, 'name': name_cache.get(symbol)})
+        entry['asset_type'] = asset_type or entry.get('asset_type', 'stock')
+        if action == 'buy':
+            total_cost = entry['avg_cost'] * entry['qty'] + quantity * price + fee
+            entry['qty'] += quantity
+            if entry['qty'] > 0:
+                entry['avg_cost'] = total_cost / entry['qty']
+            else:
+                entry['avg_cost'] = 0.0
+        elif action == 'sell':
+            available_qty = entry['qty']
+            avg_cost = entry['avg_cost'] if available_qty > 0 else 0.0
+            proceeds = quantity * price - fee
+            sell_qty = quantity if available_qty <= 0 else min(quantity, available_qty)
+            cost_basis = sell_qty * avg_cost
+            profit = proceeds - cost_basis
+            realized_all_time += profit
+            if start_date <= trade_day <= end_date:
+                realized_period[symbol] += profit
+                realized_total_period += profit
+            entry['qty'] = available_qty - quantity
+            if entry['qty'] <= 0:
+                entry['qty'] = 0.0
+                entry['avg_cost'] = 0.0
+        elif action == 'dividend':
+            proceeds = quantity * price - fee
+            realized_all_time += proceeds
+            if start_date <= trade_day <= end_date:
+                realized_period[symbol] += proceeds
+                realized_total_period += proceeds
+
+    # Remove empty holdings
+    holdings = {sym: data for sym, data in holdings.items() if data['qty'] > 0}
+    return {
+        'holdings': holdings,
+        'realized_period': realized_period,
+        'realized_total': realized_total_period,
+        'realized_all_time': realized_all_time,
+    }
+
+
+def _fetch_quotes_for_symbols(entries: List[tuple[str, str]]) -> Dict[str, dict]:
+    if not entries:
+        return {}
+
+    async def gather():
+        connector = aiohttp.TCPConnector(limit=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async def fetch_one(sym: str, asset_type: str):
+                if asset_type == 'fund':
+                    return await fetch_fund_quote(session, sym)
+                try:
+                    secid = symbol_to_secid(sym)
+                except Exception:
+                    return None
+                return await fetch_quote_basic(session, secid)
+
+            tasks = [fetch_one(sym, asset_type) for sym, asset_type in entries]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: Dict[str, dict] = {}
+        for (sym, _asset_type), res in zip(entries, results):
+            if isinstance(res, Exception) or res is None:
+                continue
+            out[sym] = res
+        return out
+
+    try:
+        return asyncio.run(gather())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(gather())
+        finally:
+            loop.close()
+
+
 @app.route('/watchlist', methods=['GET', 'POST'])
 @login_required
 def watchlist_view():
@@ -295,6 +441,339 @@ def watchlist_view():
         rss_prefix=resolved_prefix,
         hash_only=RSS_TOKEN_HASH_ONLY,
     )
+
+
+@app.route('/trades', methods=['GET', 'POST'])
+@login_required
+def trades_view():
+    db = get_db()
+    if request.method == 'POST':
+        trade_date = request.form.get('trade_date', '').strip()
+        symbol_input_raw = request.form.get('symbol', '')
+        symbol_input = symbol_input_raw.strip()
+        action = request.form.get('action', '').strip().lower()
+        quantity_raw = request.form.get('quantity', '').strip()
+        price_raw = request.form.get('price', '').strip()
+        fee_raw = request.form.get('fee', '').strip()
+        asset_type = request.form.get('asset_type', 'stock').strip().lower()
+
+        upper_symbol = symbol_input.upper()
+        if upper_symbol.endswith('.OF'):
+            asset_type = 'fund'
+
+        if asset_type not in {'stock', 'fund'}:
+            flash('请选择有效的资产类型。', 'error')
+            return redirect(url_for('trades_view'))
+        if not trade_date or not symbol_input or action not in {'buy', 'sell', 'dividend'}:
+            flash('请完整填写日期/代码/方向。', 'error')
+            return redirect(url_for('trades_view'))
+        normalized_symbol = _normalize_trade_symbol(symbol_input, asset_type)
+        if not normalized_symbol:
+            flash('股票代码格式不正确。', 'error')
+            return redirect(url_for('trades_view'))
+        symbol = normalized_symbol
+        try:
+            quantity = float(quantity_raw)
+            price = float(price_raw)
+            if quantity <= 0 or price < 0:
+                raise ValueError
+            if action in {'buy', 'sell'} and price == 0:
+                raise ValueError
+        except ValueError:
+            flash('数量与价格需为正数。', 'error')
+            return redirect(url_for('trades_view'))
+        try:
+            fee = float(fee_raw) if fee_raw else 0.0
+        except ValueError:
+            flash('手续费需为数字。', 'error')
+            return redirect(url_for('trades_view'))
+
+        db.execute(
+            'INSERT INTO trade_logs (user_id, trade_date, symbol, action, quantity, price, fee, asset_type, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (current_user.id, trade_date, symbol, action, quantity, price, fee, asset_type, None),
+        )
+        db.commit()
+        flash('已记录交易。', 'success')
+        return redirect(url_for('trades_view'))
+
+    page_raw = request.args.get('page', '1')
+    try:
+        page = int(page_raw)
+    except ValueError:
+        page = 1
+    if page < 1:
+        page = 1
+    per_page = 50
+    total = db.execute('SELECT COUNT(1) FROM trade_logs WHERE user_id = ?', (current_user.id,)).fetchone()[0]
+    total = total or 0
+    max_page = max(1, math.ceil(total / per_page)) if total else 1
+    if page > max_page:
+        page = max_page
+    offset = (page - 1) * per_page
+    trades = db.execute(
+        'SELECT id, trade_date, symbol, action, quantity, price, fee, asset_type, note, created_at FROM trade_logs WHERE user_id = ? ORDER BY trade_date DESC, id DESC LIMIT ? OFFSET ?',
+        (current_user.id, per_page, offset),
+    ).fetchall()
+
+    name_map: Dict[str, str] = {}
+    if trades:
+        unique_entries = []
+        seen = set()
+        for row in trades:
+            key = (row['symbol'], row['asset_type'])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_entries.append(key)
+        quotes = _fetch_quotes_for_symbols(unique_entries)
+        name_map = {sym: info.get('name') for sym, info in quotes.items() if info.get('name')}
+
+    return render_template(
+        'trades.html',
+        trades=trades,
+        page=page,
+        pages=max_page,
+        per_page=per_page,
+        total=total,
+        name_map=name_map,
+    )
+
+
+def _get_trade_or_404(trade_id: int):
+    db = get_db()
+    trade = db.execute(
+        'SELECT id, trade_date, symbol, action, quantity, price, fee, asset_type, note FROM trade_logs WHERE id = ? AND user_id = ?',
+        (trade_id, current_user.id),
+    ).fetchone()
+    if not trade:
+        abort(404)
+    return trade
+
+
+@app.route('/trades/<int:trade_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_trade(trade_id: int):
+    trade = _get_trade_or_404(trade_id)
+    db = get_db()
+    if request.method == 'POST':
+        trade_date = request.form.get('trade_date', '').strip()
+        symbol_input_raw = request.form.get('symbol', '')
+        symbol_input = symbol_input_raw.strip()
+        action = request.form.get('action', '').strip().lower()
+        quantity_raw = request.form.get('quantity', '').strip()
+        price_raw = request.form.get('price', '').strip()
+        fee_raw = request.form.get('fee', '').strip()
+        asset_type = request.form.get('asset_type', 'stock').strip().lower()
+
+        upper_symbol = symbol_input.upper()
+        if upper_symbol.endswith('.OF'):
+            asset_type = 'fund'
+
+        if asset_type not in {'stock', 'fund'}:
+            flash('请选择有效的资产类型。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
+        if not trade_date or not symbol_input or action not in {'buy', 'sell', 'dividend'}:
+            flash('请完整填写日期/代码/方向。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
+        normalized_symbol = _normalize_trade_symbol(symbol_input, asset_type)
+        if not normalized_symbol:
+            flash('股票代码格式不正确。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
+        try:
+            quantity = float(quantity_raw)
+            price = float(price_raw)
+            if quantity <= 0 or price < 0:
+                raise ValueError
+            if action in {'buy', 'sell'} and price == 0:
+                raise ValueError
+        except ValueError:
+            flash('数量与价格需为正数。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
+        try:
+            fee = float(fee_raw) if fee_raw else 0.0
+        except ValueError:
+            flash('手续费需为数字。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
+
+        db.execute(
+            'UPDATE trade_logs SET trade_date=?, symbol=?, action=?, quantity=?, price=?, fee=?, asset_type=?, note=NULL WHERE id=? AND user_id=?',
+            (trade_date, normalized_symbol, action, quantity, price, fee, asset_type, trade_id, current_user.id),
+        )
+        db.commit()
+        flash('已更新交易。', 'success')
+        return redirect(url_for('trades_view'))
+
+    return render_template('trade_edit.html', trade=trade)
+
+
+@app.route('/trades/<int:trade_id>/delete', methods=['POST'])
+@login_required
+def delete_trade(trade_id: int):
+    db = get_db()
+    cur = db.execute('DELETE FROM trade_logs WHERE id = ? AND user_id = ?', (trade_id, current_user.id))
+    db.commit()
+    if cur.rowcount:
+        flash('已删除交易。', 'success')
+    else:
+        flash('未找到对应交易。', 'error')
+    return redirect(url_for('trades_view'))
+
+
+@app.route('/portfolio', methods=['GET'])
+@login_required
+def portfolio_view():
+    db = get_db()
+    today = dt.date.today()
+    default_start = today.replace(month=1, day=1)
+    start_raw = request.args.get('start') or default_start.isoformat()
+    end_raw = request.args.get('end') or today.isoformat()
+    start_date = _parse_iso_date(start_raw) or default_start
+    end_date = _parse_iso_date(end_raw) or today
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    rows = db.execute(
+        'SELECT trade_date, symbol, action, quantity, price, fee, asset_type FROM trade_logs WHERE user_id = ? ORDER BY trade_date ASC, id ASC',
+        (current_user.id,),
+    ).fetchall()
+    symbol_asset: Dict[str, str] = {}
+    for r in rows:
+        asset = r['asset_type'] or 'stock'
+        symbol_asset[r['symbol']] = asset
+    initial_quotes = _fetch_quotes_for_symbols(list(symbol_asset.items()))
+    name_cache = {sym: info.get('name') for sym, info in initial_quotes.items() if info.get('name')}
+    portfolio = _build_portfolio(rows, start_date, end_date, name_cache)
+    holdings: Dict[str, dict] = portfolio['holdings']
+    realized_period: Dict[str, float] = portfolio['realized_period']
+
+    symbols = sorted(holdings.keys())
+    quotes = _fetch_quotes_for_symbols([(sym, holdings[sym].get('asset_type', 'stock')) for sym in symbols])
+    positions = []
+    total_market_value = 0.0
+    total_cost_basis = 0.0
+    unrealized_total = 0.0
+    daily_stock_pnl = 0.0
+    daily_fund_pnl = 0.0
+
+    for sym in symbols:
+        data = holdings[sym]
+        qty = data['qty']
+        avg_cost = data['avg_cost']
+        cost_basis = qty * avg_cost
+        quote = quotes.get(sym)
+        price = (quote or {}).get('price')
+        change_pct_raw = (quote or {}).get('change_pct')
+        try:
+            change_pct = float(change_pct_raw)
+        except (TypeError, ValueError):
+            change_pct = None
+        market_value = None if price is None else price * qty
+        unrealized = None if market_value is None else market_value - cost_basis
+        daily_change = None
+        if price is not None and change_pct is not None and market_value is not None:
+            c = change_pct / 100.0
+            denom = 1.0 + c
+            if abs(denom) > 1e-9:
+                prev_price = price / denom
+                daily_change = (price - prev_price) * qty
+        if market_value is not None:
+            total_market_value += market_value
+        total_cost_basis += cost_basis
+        if unrealized is not None:
+            unrealized_total += unrealized
+        asset_type_val = data.get('asset_type', 'stock')
+        if asset_type_val == 'stock' and daily_change is not None:
+            daily_stock_pnl += daily_change
+        if asset_type_val == 'fund' and daily_change is not None:
+            daily_fund_pnl += daily_change
+        name = holdings[sym].get('name') or (quote or {}).get('name')
+        positions.append({
+            'symbol': sym,
+            'name': name,
+            'asset_type': holdings[sym].get('asset_type', 'stock'),
+            'quantity': qty,
+            'avg_cost': avg_cost,
+            'price': price,
+            'market_value': market_value,
+            'unrealized': unrealized,
+            'change_pct': change_pct,
+            'daily_change': daily_change,
+            'cost_basis': cost_basis,
+        })
+
+    realized_items = sorted(
+        [{'symbol': sym, 'value': val} for sym, val in realized_period.items()],
+        key=lambda x: x['symbol'],
+    )
+
+    profits = db.execute(
+        'SELECT id, profit_date, amount, note FROM initial_profits WHERE user_id = ? ORDER BY profit_date DESC, id DESC',
+        (current_user.id,),
+    ).fetchall()
+    initial_period_total = 0.0
+    for row in profits:
+        pdate = _parse_iso_date(row['profit_date'])
+        if pdate and start_date <= pdate <= end_date:
+            initial_period_total += float(row['amount'])
+
+    realized_with_initial = portfolio['realized_total'] + initial_period_total
+    combined_total = realized_with_initial + unrealized_total
+    daily_total = daily_stock_pnl + daily_fund_pnl
+
+    return render_template(
+        'portfolio.html',
+        positions=positions,
+        realized_total=portfolio['realized_total'],
+        realized_with_initial=realized_with_initial,
+        realized_items=realized_items,
+        realized_all_time=portfolio['realized_all_time'],
+        unrealized_total=unrealized_total,
+        total_market_value=total_market_value,
+        total_cost_basis=total_cost_basis,
+        combined_total=combined_total,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        initial_period_total=initial_period_total,
+        initial_profits=profits,
+        today_str=today.isoformat(),
+        daily_stock_pnl=daily_stock_pnl,
+        daily_fund_pnl=daily_fund_pnl,
+        daily_total=daily_total,
+    )
+
+
+@app.route('/initial_profits', methods=['POST'])
+@login_required
+def add_initial_profit():
+    amount_raw = request.form.get('amount', '').strip()
+    note = request.form.get('note', '').strip() or None
+    try:
+        amount = float(amount_raw)
+    except ValueError:
+        flash('初始盈利需为数字。', 'error')
+        return redirect(url_for('portfolio_view'))
+    profit_date = dt.date.today().isoformat()
+    db = get_db()
+    db.execute(
+        'INSERT INTO initial_profits (user_id, profit_date, amount, note) VALUES (?, ?, ?, ?)',
+        (current_user.id, profit_date, amount, note),
+    )
+    db.commit()
+    flash('已记录初始盈利。', 'success')
+    return redirect(url_for('portfolio_view'))
+
+
+@app.route('/initial_profits/<int:profit_id>/delete', methods=['POST'])
+@login_required
+def delete_initial_profit(profit_id: int):
+    db = get_db()
+    cur = db.execute('DELETE FROM initial_profits WHERE id = ? AND user_id = ?', (profit_id, current_user.id))
+    db.commit()
+    if cur.rowcount:
+        flash('已删除初始盈利记录。', 'success')
+    else:
+        flash('未找到对应记录。', 'error')
+    return redirect(url_for('portfolio_view'))
 
 
 @app.route('/reset_token', methods=['POST'])
