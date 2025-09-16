@@ -30,6 +30,9 @@ except ModuleNotFoundError:
 import asyncio
 import aiohttp
 import datetime as dt
+
+
+CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
 import xml.etree.ElementTree as ET
 
 
@@ -388,11 +391,27 @@ def generate_rss_response(token: str):
                 f"中单: {color_num(rowd['大单'])} 亿元<br>"
                 f"小单: {color_num(rowd['超大单'])} 亿元"
             )
+            # Derive per-item metadata consumed by RSS readers
+            base_time = rowd.get('time') or now.strftime('%Y-%m-%d %H:%M:%S')
+            pub_dt = None
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+                try:
+                    pub_dt = dt.datetime.strptime(base_time, fmt).replace(tzinfo=CHINA_TZ)
+                    break
+                except ValueError:
+                    continue
+            if pub_dt is None:
+                pub_dt = now.astimezone(CHINA_TZ)
+            guid_seed = f"{symbol}|{base_time}|{rowd.get('主力')}|{rowd.get('超大单')}|{rowd.get('大单')}|{rowd.get('中单')}|{rowd.get('小单')}"
+            guid_hash = hashlib.sha1(guid_seed.encode('utf-8')).hexdigest()[:12]
+            exch = symbol.split('.')[-1].lower()
+            quote_link = f"https://quote.eastmoney.com/{exch}{symbol.split('.')[0].lower()}.html"
             item = {
-                'guid': f"{symbol}_{rowd['time']}",
-                'title': f"{name} / {(nret or '')} {rowd['time']}",
+                'guid': f"{symbol}_{base_time}_{guid_hash}",
+                'title': f"{name} / {(nret or '')} {base_time}",
                 'description': desc,
-                'pubDate': now.strftime('%a, %d %b %Y %H:%M:%S %z')
+                'pubDate': pub_dt.strftime('%a, %d %b %Y %H:%M:%S %z'),
+                'link': quote_link,
             }
             out.append(item)
         return out
@@ -409,7 +428,10 @@ def generate_rss_response(token: str):
         item = ET.SubElement(ch, 'item')
         ET.SubElement(item, 'title').text = it['title']
         ET.SubElement(item, 'description').text = it['description']
-        ET.SubElement(item, 'guid').text = it['guid']
+        ET.SubElement(item, 'link').text = it['link']
+        guid_el = ET.SubElement(item, 'guid')
+        guid_el.text = it['guid']
+        guid_el.set('isPermaLink', 'false')
         ET.SubElement(item, 'pubDate').text = it['pubDate']
     xml = ET.tostring(rss, encoding='utf-8', xml_declaration=True)
     resp = make_response(xml)

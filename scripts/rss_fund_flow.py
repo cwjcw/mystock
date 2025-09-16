@@ -46,6 +46,7 @@ async def fetch_latest_minute(session: aiohttp.ClientSession, secid: str) -> Tup
         "klt": "1",
         "lmt": "1",
         "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "_": str(int(time.time() * 1000)),
     }
     try:
         async with session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=10) as resp:
@@ -73,6 +74,7 @@ async def fetch_quote_basic(session: aiohttp.ClientSession, secid: str) -> Optio
     params = {
         "secid": secid,
         "fields": "f58,f116,f117,f43,f170,f169,f152",
+        "_": str(int(time.time() * 1000)),
     }
     try:
         async with session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=10) as resp:
