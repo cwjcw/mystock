@@ -1,8 +1,11 @@
 import argparse
 import datetime as dt
+import os
 import random
 import time
+from pathlib import Path
 from typing import List, Dict, Optional
+
 import requests
 
 # Robust import to support both `python scripts/daily_bulk_flow.py` and `python -m scripts.daily_bulk_flow`
@@ -24,6 +27,39 @@ EM_HEADERS = {
 }
 SESSION = requests.Session()
 SESSION.trust_env = False
+
+
+def _init_proxy_from_env():
+    """Configure SESSION proxies if PROXY_API_URL is provided."""
+    api_url = os.getenv("PROXY_API_URL")
+    if not api_url:
+        return
+    username = os.getenv("PROXY_USERNAME")
+    password = os.getenv("PROXY_PASSWORD")
+    try:
+        proxy_ip = SESSION.get(api_url, timeout=10).text.strip()
+    except requests.RequestException:
+        return
+    if not proxy_ip:
+        return
+    if username and password:
+        proxy_auth = f"{username}:{password}@{proxy_ip}"
+    else:
+        proxy_auth = proxy_ip
+    proxy_url = f"http://{proxy_auth}/"
+    SESSION.proxies.update({"http": proxy_url, "https": proxy_url})
+
+
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+if ENV_FILE.exists():
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        k, v = line.split('=', 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+_init_proxy_from_env()
 
 
 def fetch_all_stock_codes() -> List[str]:

@@ -216,3 +216,7 @@ tmp_*
 # Project data artifacts (do not version control)
 data/*.db
 data/*.rss
+
+# Proxy credentials / configs
+proxy_*.json
+proxy_*.txt
