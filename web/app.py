@@ -7,7 +7,7 @@ import math
 from collections import defaultdict, deque
 import sqlite3
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from flask import Flask, g, render_template, request, redirect, url_for, flash, make_response, abort
 from flask_login import (
@@ -419,6 +419,119 @@ def _fetch_quotes_for_symbols(entries: List[tuple[str, str]]) -> Dict[str, dict]
             loop.close()
 
 
+def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date) -> dict:
+    db = get_db()
+    rows = db.execute(
+        'SELECT trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type FROM trade_logs WHERE user_id = ? ORDER BY trade_date ASC, id ASC',
+        (user_id,),
+    ).fetchall()
+
+    symbol_asset: Dict[str, str] = {}
+    for r in rows:
+        asset = (r['asset_type'] or 'stock') if 'asset_type' in r.keys() else 'stock'
+        symbol_asset[r['symbol']] = asset
+
+    initial_quotes = _fetch_quotes_for_symbols(list(symbol_asset.items())) if symbol_asset else {}
+    name_cache = {sym: info.get('name') for sym, info in initial_quotes.items() if info.get('name')}
+
+    portfolio = _build_portfolio(rows, start_date, end_date, name_cache)
+    holdings: Dict[str, dict] = portfolio['holdings']
+
+    symbols = sorted(holdings.keys())
+    quotes = _fetch_quotes_for_symbols(
+        [(sym, holdings[sym].get('asset_type', 'stock')) for sym in symbols]
+    ) if symbols else {}
+
+    positions = []
+    total_market_value = 0.0
+    total_cost_basis = 0.0
+    unrealized_total = 0.0
+    daily_stock_pnl = 0.0
+    daily_fund_pnl = 0.0
+
+    for sym in symbols:
+        data = holdings[sym]
+        qty = data['qty']
+        avg_cost = data['avg_cost']
+        cost_basis = qty * avg_cost
+        quote = quotes.get(sym)
+        price = (quote or {}).get('price')
+        change_pct_raw = (quote or {}).get('change_pct')
+        try:
+            change_pct = float(change_pct_raw)
+        except (TypeError, ValueError):
+            change_pct = None
+        market_value = None if price is None else price * qty
+        unrealized = None if market_value is None else market_value - cost_basis
+        daily_change = None
+        if price is not None and change_pct is not None and market_value is not None:
+            c = change_pct / 100.0
+            denom = 1.0 + c
+            if abs(denom) > 1e-9:
+                prev_price = price / denom
+                daily_change = (price - prev_price) * qty
+        if market_value is not None:
+            total_market_value += market_value
+        total_cost_basis += cost_basis
+        if unrealized is not None:
+            unrealized_total += unrealized
+        asset_type_val = data.get('asset_type', 'stock')
+        if asset_type_val == 'stock' and daily_change is not None:
+            daily_stock_pnl += daily_change
+        if asset_type_val == 'fund' and daily_change is not None:
+            daily_fund_pnl += daily_change
+        name = holdings[sym].get('name') or (quote or {}).get('name')
+        positions.append({
+            'symbol': sym,
+            'name': name,
+            'asset_type': asset_type_val,
+            'quantity': qty,
+            'avg_cost': avg_cost,
+            'price': price,
+            'market_value': market_value,
+            'unrealized': unrealized,
+            'change_pct': change_pct,
+            'daily_change': daily_change,
+            'cost_basis': cost_basis,
+        })
+
+    realized_items = sorted(
+        [{'symbol': sym, 'value': val} for sym, val in portfolio['realized_period'].items()],
+        key=lambda x: x['symbol'],
+    )
+
+    profits = db.execute(
+        'SELECT id, profit_date, amount, note FROM initial_profits WHERE user_id = ? ORDER BY profit_date DESC, id DESC',
+        (user_id,),
+    ).fetchall()
+    initial_period_total = 0.0
+    for row in profits:
+        pdate = _parse_iso_date(row['profit_date'])
+        if pdate and start_date <= pdate <= end_date:
+            initial_period_total += float(row['amount'])
+
+    realized_with_initial = portfolio['realized_total'] + initial_period_total
+    combined_total = realized_with_initial + unrealized_total
+    daily_total = daily_stock_pnl + daily_fund_pnl
+
+    return {
+        'positions': positions,
+        'realized_items': realized_items,
+        'realized_total': portfolio['realized_total'],
+        'realized_all_time': portfolio['realized_all_time'],
+        'realized_with_initial': realized_with_initial,
+        'initial_period_total': initial_period_total,
+        'initial_profits': profits,
+        'unrealized_total': unrealized_total,
+        'total_market_value': total_market_value,
+        'total_cost_basis': total_cost_basis,
+        'combined_total': combined_total,
+        'daily_stock_pnl': daily_stock_pnl,
+        'daily_fund_pnl': daily_fund_pnl,
+        'daily_total': daily_total,
+    }
+
+
 @app.route('/watchlist', methods=['GET', 'POST'])
 @login_required
 def watchlist_view():
@@ -638,7 +751,6 @@ def delete_trade(trade_id: int):
 @app.route('/portfolio', methods=['GET'])
 @login_required
 def portfolio_view():
-    db = get_db()
     today = dt.date.today()
     default_start = today.replace(month=1, day=1)
     start_raw = request.args.get('start') or default_start.isoformat()
@@ -648,113 +760,27 @@ def portfolio_view():
     if end_date < start_date:
         start_date, end_date = end_date, start_date
 
-    rows = db.execute(
-        'SELECT trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type FROM trade_logs WHERE user_id = ? ORDER BY trade_date ASC, id ASC',
-        (current_user.id,),
-    ).fetchall()
-    symbol_asset: Dict[str, str] = {}
-    for r in rows:
-        asset = r['asset_type'] or 'stock'
-        symbol_asset[r['symbol']] = asset
-    initial_quotes = _fetch_quotes_for_symbols(list(symbol_asset.items()))
-    name_cache = {sym: info.get('name') for sym, info in initial_quotes.items() if info.get('name')}
-    portfolio = _build_portfolio(rows, start_date, end_date, name_cache)
-    holdings: Dict[str, dict] = portfolio['holdings']
-    realized_period: Dict[str, float] = portfolio['realized_period']
-
-    symbols = sorted(holdings.keys())
-    quotes = _fetch_quotes_for_symbols([(sym, holdings[sym].get('asset_type', 'stock')) for sym in symbols])
-    positions = []
-    total_market_value = 0.0
-    total_cost_basis = 0.0
-    unrealized_total = 0.0
-    daily_stock_pnl = 0.0
-    daily_fund_pnl = 0.0
-
-    for sym in symbols:
-        data = holdings[sym]
-        qty = data['qty']
-        avg_cost = data['avg_cost']
-        cost_basis = qty * avg_cost
-        quote = quotes.get(sym)
-        price = (quote or {}).get('price')
-        change_pct_raw = (quote or {}).get('change_pct')
-        try:
-            change_pct = float(change_pct_raw)
-        except (TypeError, ValueError):
-            change_pct = None
-        market_value = None if price is None else price * qty
-        unrealized = None if market_value is None else market_value - cost_basis
-        daily_change = None
-        if price is not None and change_pct is not None and market_value is not None:
-            c = change_pct / 100.0
-            denom = 1.0 + c
-            if abs(denom) > 1e-9:
-                prev_price = price / denom
-                daily_change = (price - prev_price) * qty
-        if market_value is not None:
-            total_market_value += market_value
-        total_cost_basis += cost_basis
-        if unrealized is not None:
-            unrealized_total += unrealized
-        asset_type_val = data.get('asset_type', 'stock')
-        if asset_type_val == 'stock' and daily_change is not None:
-            daily_stock_pnl += daily_change
-        if asset_type_val == 'fund' and daily_change is not None:
-            daily_fund_pnl += daily_change
-        name = holdings[sym].get('name') or (quote or {}).get('name')
-        positions.append({
-            'symbol': sym,
-            'name': name,
-            'asset_type': holdings[sym].get('asset_type', 'stock'),
-            'quantity': qty,
-            'avg_cost': avg_cost,
-            'price': price,
-            'market_value': market_value,
-            'unrealized': unrealized,
-            'change_pct': change_pct,
-            'daily_change': daily_change,
-            'cost_basis': cost_basis,
-        })
-
-    realized_items = sorted(
-        [{'symbol': sym, 'value': val} for sym, val in realized_period.items()],
-        key=lambda x: x['symbol'],
-    )
-
-    profits = db.execute(
-        'SELECT id, profit_date, amount, note FROM initial_profits WHERE user_id = ? ORDER BY profit_date DESC, id DESC',
-        (current_user.id,),
-    ).fetchall()
-    initial_period_total = 0.0
-    for row in profits:
-        pdate = _parse_iso_date(row['profit_date'])
-        if pdate and start_date <= pdate <= end_date:
-            initial_period_total += float(row['amount'])
-
-    realized_with_initial = portfolio['realized_total'] + initial_period_total
-    combined_total = realized_with_initial + unrealized_total
-    daily_total = daily_stock_pnl + daily_fund_pnl
+    context = _get_portfolio_context(current_user.id, start_date, end_date)
 
     return render_template(
         'portfolio.html',
-        positions=positions,
-        realized_total=portfolio['realized_total'],
-        realized_with_initial=realized_with_initial,
-        realized_items=realized_items,
-        realized_all_time=portfolio['realized_all_time'],
-        unrealized_total=unrealized_total,
-        total_market_value=total_market_value,
-        total_cost_basis=total_cost_basis,
-        combined_total=combined_total,
+        positions=context['positions'],
+        realized_total=context['realized_total'],
+        realized_with_initial=context['realized_with_initial'],
+        realized_items=context['realized_items'],
+        realized_all_time=context['realized_all_time'],
+        unrealized_total=context['unrealized_total'],
+        total_market_value=context['total_market_value'],
+        total_cost_basis=context['total_cost_basis'],
+        combined_total=context['combined_total'],
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
-        initial_period_total=initial_period_total,
-        initial_profits=profits,
+        initial_period_total=context['initial_period_total'],
+        initial_profits=context['initial_profits'],
         today_str=today.isoformat(),
-        daily_stock_pnl=daily_stock_pnl,
-        daily_fund_pnl=daily_fund_pnl,
-        daily_total=daily_total,
+        daily_stock_pnl=context['daily_stock_pnl'],
+        daily_fund_pnl=context['daily_fund_pnl'],
+        daily_total=context['daily_total'],
     )
 
 
@@ -912,6 +938,54 @@ def generate_rss_response(token: str):
         return out
 
     items = asyncio.run(build_items())
+
+    snapshot = _get_portfolio_context(row['id'], dt.date.today().replace(month=1, day=1), dt.date.today())
+    if snapshot:
+        positions = snapshot['positions']
+
+        def fmt_currency(val: Optional[float]) -> str:
+            if val is None:
+                return '-'
+            try:
+                return f"{round(val)}"
+            except Exception:
+                return '-'
+
+        def fmt_pct(val: Optional[float]) -> str:
+            return '-' if val is None else f"{val:.2f}%"
+
+        table_rows = ""
+        for pos in positions[:10]:
+            table_rows += (
+                "<tr>"
+                f"<td>{pos['name'] or pos['symbol']}</td>"
+                f"<td>{'-' if pos['price'] is None else f'{pos['price']:.2f}'}</td>"
+                f"<td>{fmt_pct(pos['change_pct'])}</td>"
+                f"<td>{fmt_currency(pos['market_value'])}</td>"
+                f"<td>{fmt_currency(pos['unrealized'])}</td>"
+                f"<td>{fmt_pct(None if pos['unrealized'] is None or pos['cost_basis'] in (None, 0) else (pos['unrealized'] / pos['cost_basis']) * 100)}</td>"
+                f"<td>{fmt_currency(pos['daily_change'])}</td>"
+                "</tr>"
+            )
+
+        portfolio_desc = (
+            f"<p>周期已实现盈亏：{fmt_currency(snapshot['realized_with_initial'])} 元</p>"
+            f"<p>当前持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
+            f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元)</p>"
+            "<table border='1' cellspacing='0' cellpadding='4'>"
+            "<tr><th>名称</th><th>最新价</th><th>涨跌幅</th><th>市值</th><th>持仓盈亏</th><th>持仓盈亏%</th><th>当日收益</th></tr>"
+            f"{table_rows}" \
+            "</table>"
+        )
+
+        portfolio_item = {
+            'guid': f"portfolio_{row['id']}_{dt.date.today().isoformat()}",
+            'title': f"持仓与盈亏 {dt.date.today().isoformat()}",
+            'description': portfolio_desc,
+            'pubDate': dt.datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z'),
+            'link': f"https://{PUBLIC_DOMAIN}/portfolio",
+        }
+        items.insert(0, portfolio_item)
     # Build RSS XML
     rss = ET.Element('rss', version='2.0')
     ch = ET.SubElement(rss, 'channel')

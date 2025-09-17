@@ -62,6 +62,11 @@ python scripts/daily_bulk_flow.py --db data/stocks.db --date 2025-09-12
 ```
 python scripts/daily_bulk_flow.py --db data/stocks.db --schedule
 ```
+- 自动补全历史到指定日期（示例：抓取最早可用数据至 2025-09-15）：
+```
+python scripts/daily_bulk_flow.py --db data/stocks.db --fill-to 2025-09-15
+```
+  - 脚本会自动判断东方财富最早能提供的数据日期，并在抓取每个交易日后刷新一次代理 IP。
 
 ## 多用户 Web（登录配置 + 每用户 RSS）
 - 启动服务（端口 18888）：
@@ -74,9 +79,19 @@ python web/app.py
   - 推荐外部 RSS 链接：`https://stock.yourdomin.cn/<RSS_PREFIX>/<rsstoken>.rss`
     - 默认 `<RSS_PREFIX>` 为“用户名”，可改为固定前缀（见 .env）
   - 本地调试：`/u/<rsstoken>.rss` 或 `/<RSS_PREFIX>/<rsstoken>.rss`
+  - RSS 条目除了每只股票的分钟资金流，还会追加一条 “持仓与盈亏” 快照：
+    - 包含周期已实现盈亏（含初始盈利）、当前持仓盈亏、当日盈亏（股票/基金拆分）
+    - 前 10 项持仓的最新价、涨跌幅、市值、持仓盈亏、持仓盈亏%、当日收益；除涨跌幅外的数字均四舍五入为整数
   - 重置 Token：页面一键重置；旧链接立即失效
   - 更安全模式：设置 `RSS_TOKEN_HASH_ONLY=true`，注册/重置时仅显示一次 token，数据库存哈希
   - 刷新频率限制：默认每 Token/每 IP 每分钟 1 次（超限返回 429），可在 .env 调整
+
+### Web 端交易录入
+- 支持买入/卖出/分红三种方向
+- 可单独填写手续费和印花税，系统会自动在成本与盈亏中扣除
+
+### 代理
+- 在 `.env` 中配置 `PROXY_API_URL`、`PROXY_USERNAME`、`PROXY_PASSWORD` 后，日终抓取脚本会自动向代理服务拉取 IP 并定期刷新。
 
 ## .env 配置（项目根目录）
 启动时自动读取 `.env`（也可用进程环境变量覆盖），示例：
