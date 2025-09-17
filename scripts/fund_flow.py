@@ -121,6 +121,14 @@ def fetch_fund_flow_dayk(
     return rows
 
 
+def earliest_fund_flow_date(code: str) -> Optional[str]:
+    """Return the earliest available trading date for the given stock."""
+    rows = fetch_fund_flow_dayk(code)
+    if not rows:
+        return None
+    return min(r["date"] for r in rows)
+
+
 def merge_latest_on_date(code: str, date: Optional[str]) -> Dict:
     """
     Return a single merged record for the specified date (or the latest if date is None):
@@ -232,6 +240,12 @@ def save_to_sqlite(results: List[Dict], db_path: str):
             def sc(x):
                 return round(float(x) / 1e8, 2) if x is not None else None
             market_cap_scaled = sc(r.get("market_cap"))
+            try:
+                pct = float(r.get("pct_chg"))
+            except (TypeError, ValueError):
+                pct = None
+            if pct is not None:
+                pct = round(pct, 2)
             flow_rows.append(
                 (
                     r.get("code"),
@@ -242,7 +256,7 @@ def save_to_sqlite(results: List[Dict], db_path: str):
                     sc(r.get("large")),
                     sc(r.get("medium")),
                     sc(r.get("small")),
-                    r.get("change_pct"),
+                    pct,
                     r.get("name"),
                     market_cap_scaled,
                 )
@@ -282,6 +296,7 @@ def main():
     parser.add_argument("--db", dest="db_path", help="SQLite file path to save results")
     parser.add_argument("--use-proxy", action="store_true", help="Use system proxy settings (HTTP[S]_PROXY)")
     parser.add_argument("--timeout", type=float, default=None, help="HTTP timeout seconds (default 10)")
+    parser.add_argument("--earliest", action="store_true", help="Only print earliest available date for each code")
     args = parser.parse_args()
 
     # Configure session per CLI
@@ -290,6 +305,13 @@ def main():
     if args.timeout is not None:
         global DEFAULT_TIMEOUT
         DEFAULT_TIMEOUT = args.timeout
+
+    if args.earliest:
+        for c in args.codes:
+            code_only = c[-6:] if len(c) > 6 else c
+            earliest = earliest_fund_flow_date(code_only)
+            print(f"{c}: earliest date = {earliest}")
+        return
 
     results: List[Dict] = []
     for c in args.codes:
@@ -314,14 +336,19 @@ def main():
             return None
 
     def to_cn_record(r: Dict) -> Dict:
+        try:
+            pct = float(r.get("pct_chg")) if r.get("pct_chg") is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        if pct is not None:
+            pct = round(pct, 2)
         return {
             "日期": r.get("date"),
             "代码": r.get("code"),
             "名称": r.get("name"),
             "交易所": r.get("exchange"),
             "最新价": r.get("price"),
-            # 涨跌幅改为从行情接口实时获取（fetch_basic_info 的 change_pct）
-            "涨跌幅": r.get("change_pct"),
+            "涨跌幅": pct,
             "总市值": _scale(r.get("market_cap")),
             "主力": _scale(r.get("main")),
             "超大单": _scale(r.get("ultra_large")),

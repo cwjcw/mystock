@@ -37,6 +37,10 @@
     <label for="fee">手续费</label>
     <input id="fee" name="fee" type="number" step="0.01" min="0" value="{{ '%.2f'|format(trade.fee or 0) }}">
   </div>
+  <div class="form-row">
+    <label for="stamp_tax">印花税</label>
+    <input id="stamp_tax" name="stamp_tax" type="number" step="0.01" min="0" value="{{ '%.2f'|format(trade.stamp_tax or 0) }}">
+  </div>
   <div class="actions">
     <button class="btn" type="submit">保存修改</button>
     <a class="btn" href="{{ url_for('trades_view') }}">返回</a>

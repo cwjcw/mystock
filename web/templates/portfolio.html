@@ -85,8 +85,9 @@
        <th>数量</th>
        <th>持仓成本</th>
        <th>最新价</th>
-       <th>市值</th>
-       <th>持仓盈亏</th>
+        <th>市值</th>
+        <th>实时涨跌幅</th>
+        <th>持仓盈亏</th>
         <th>持仓盈亏%</th>
         <th>当日收益</th>
       </tr>
@@ -98,6 +99,7 @@
           <td>{{ '%.2f'|format(pos.quantity) }}</td>
           <td>{{ '%.4f'|format(pos.avg_cost) }}</td>
           <td>{{ '-' if pos.price is none else '%.4f'|format(pos.price) }}</td>
+          <td class="{{ 'profit-positive' if pos.change_pct is not none and pos.change_pct > 0 else 'profit-negative' if pos.change_pct is not none and pos.change_pct < 0 else '' }}">{{ '-' if pos.change_pct is none else '%.2f'|format(pos.change_pct) }}%</td>
           <td>{{ '-' if pos.market_value is none else '%.2f'|format(pos.market_value) }}</td>
           <td class="{{ 'profit-positive' if pos.unrealized is not none and pos.unrealized > 0 else 'profit-negative' if pos.unrealized is not none and pos.unrealized < 0 else '' }}">{{ '-' if pos.unrealized is none else '%.2f'|format(pos.unrealized) }}</td>
           <td class="{{ 'profit-positive' if pos.unrealized is not none and pos.unrealized > 0 else 'profit-negative' if pos.unrealized is not none and pos.unrealized < 0 else '' }}">{{ '-' if pos.unrealized is none or pos.cost_basis is none or pos.cost_basis == 0 else '%.1f'|format((pos.unrealized / pos.cost_basis) * 100) }}%</td>
@@ -105,7 +107,7 @@
       </tr>
       {% else %}
         <tr>
-          <td colspan="8">暂无持仓。</td>
+          <td colspan="9">暂无持仓。</td>
         </tr>
       {% endfor %}
     </tbody>

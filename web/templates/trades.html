@@ -34,10 +34,14 @@
       <label for="price">价格</label>
       <input id="price" name="price" type="number" step="0.0001" min="0" required>
     </div>
-    <div class="form-row">
-      <label for="fee">手续费</label>
-      <input id="fee" name="fee" type="number" step="0.01" min="0" placeholder="0">
-    </div>
+  <div class="form-row">
+    <label for="fee">手续费</label>
+    <input id="fee" name="fee" type="number" step="0.01" min="0" placeholder="0">
+  </div>
+  <div class="form-row">
+    <label for="stamp_tax">印花税</label>
+    <input id="stamp_tax" name="stamp_tax" type="number" step="0.01" min="0" placeholder="0">
+  </div>
     <div class="actions">
       <button class="btn" type="submit">保存</button>
     </div>
@@ -59,6 +63,7 @@
           <th>数量</th>
           <th>价格</th>
           <th>手续费</th>
+          <th>印花税</th>
           <th>操作</th>
         </tr>
       </thead>
@@ -75,6 +80,7 @@
             <td>{{ '%.2f'|format(row.quantity) }}</td>
             <td>{{ '%.4f'|format(row.price) }}</td>
             <td>{{ '%.2f'|format(row.fee or 0) }}</td>
+            <td>{{ '%.2f'|format(row.stamp_tax or 0) }}</td>
             <td class="table-actions">
               <form method="post" action="{{ url_for('delete_trade', trade_id=row.id) }}" onsubmit="return confirm('确认删除该记录？');">
                 <button class="btn" type="submit">删除</button>
@@ -83,7 +89,7 @@
           </tr>
         {% else %}
           <tr>
-            <td colspan="9">暂无记录，先在左侧录入一笔吧。</td>
+            <td colspan="10">暂无记录，先在左侧录入一笔吧。</td>
           </tr>
         {% endfor %}
       </tbody>

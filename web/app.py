@@ -132,6 +132,7 @@ def init_db():
             quantity REAL NOT NULL,
             price REAL NOT NULL,
             fee REAL NOT NULL DEFAULT 0,
+            stamp_tax REAL NOT NULL DEFAULT 0,
             asset_type TEXT NOT NULL DEFAULT 'stock',
             note TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -156,6 +157,8 @@ def init_db():
         trade_cols = [r[1] for r in db.execute('PRAGMA table_info(trade_logs)').fetchall()]
         if 'asset_type' not in trade_cols:
             db.execute("ALTER TABLE trade_logs ADD COLUMN asset_type TEXT NOT NULL DEFAULT 'stock'")
+        if 'stamp_tax' not in trade_cols:
+            db.execute("ALTER TABLE trade_logs ADD COLUMN stamp_tax REAL NOT NULL DEFAULT 0")
     except Exception:
         pass
     db.commit()
@@ -333,6 +336,7 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
         quantity = float(row['quantity'])
         price = float(row['price'])
         fee = float(row['fee'] or 0.0)
+        stamp_tax = float(row['stamp_tax'] or 0.0)
         trade_day = _parse_iso_date(row['trade_date']) or start_date
         try:
             asset_type = row['asset_type'] or 'stock'
@@ -342,7 +346,7 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
         entry = holdings.setdefault(symbol, {'qty': 0.0, 'avg_cost': 0.0, 'asset_type': asset_type, 'name': name_cache.get(symbol)})
         entry['asset_type'] = asset_type or entry.get('asset_type', 'stock')
         if action == 'buy':
-            total_cost = entry['avg_cost'] * entry['qty'] + quantity * price + fee
+            total_cost = entry['avg_cost'] * entry['qty'] + quantity * price + fee + stamp_tax
             entry['qty'] += quantity
             if entry['qty'] > 0:
                 entry['avg_cost'] = total_cost / entry['qty']
@@ -351,7 +355,7 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
         elif action == 'sell':
             available_qty = entry['qty']
             avg_cost = entry['avg_cost'] if available_qty > 0 else 0.0
-            proceeds = quantity * price - fee
+            proceeds = quantity * price - fee - stamp_tax
             sell_qty = quantity if available_qty <= 0 else min(quantity, available_qty)
             cost_basis = sell_qty * avg_cost
             profit = proceeds - cost_basis
@@ -364,7 +368,7 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
                 entry['qty'] = 0.0
                 entry['avg_cost'] = 0.0
         elif action == 'dividend':
-            proceeds = quantity * price - fee
+            proceeds = quantity * price - fee - stamp_tax
             realized_all_time += proceeds
             if start_date <= trade_day <= end_date:
                 realized_period[symbol] += proceeds
@@ -455,6 +459,7 @@ def trades_view():
         quantity_raw = request.form.get('quantity', '').strip()
         price_raw = request.form.get('price', '').strip()
         fee_raw = request.form.get('fee', '').strip()
+        stamp_raw = request.form.get('stamp_tax', '').strip()
         asset_type = request.form.get('asset_type', 'stock').strip().lower()
 
         upper_symbol = symbol_input.upper()
@@ -487,10 +492,15 @@ def trades_view():
         except ValueError:
             flash('手续费需为数字。', 'error')
             return redirect(url_for('trades_view'))
+        try:
+            stamp_tax = float(stamp_raw) if stamp_raw else 0.0
+        except ValueError:
+            flash('印花税需为数字。', 'error')
+            return redirect(url_for('trades_view'))
 
         db.execute(
-            'INSERT INTO trade_logs (user_id, trade_date, symbol, action, quantity, price, fee, asset_type, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (current_user.id, trade_date, symbol, action, quantity, price, fee, asset_type, None),
+            'INSERT INTO trade_logs (user_id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (current_user.id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, None),
         )
         db.commit()
         flash('已记录交易。', 'success')
@@ -511,7 +521,7 @@ def trades_view():
         page = max_page
     offset = (page - 1) * per_page
     trades = db.execute(
-        'SELECT id, trade_date, symbol, action, quantity, price, fee, asset_type, note, created_at FROM trade_logs WHERE user_id = ? ORDER BY trade_date DESC, id DESC LIMIT ? OFFSET ?',
+        'SELECT id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, note, created_at FROM trade_logs WHERE user_id = ? ORDER BY trade_date DESC, id DESC LIMIT ? OFFSET ?',
         (current_user.id, per_page, offset),
     ).fetchall()
 
@@ -542,7 +552,7 @@ def trades_view():
 def _get_trade_or_404(trade_id: int):
     db = get_db()
     trade = db.execute(
-        'SELECT id, trade_date, symbol, action, quantity, price, fee, asset_type, note FROM trade_logs WHERE id = ? AND user_id = ?',
+        'SELECT id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, note FROM trade_logs WHERE id = ? AND user_id = ?',
         (trade_id, current_user.id),
     ).fetchone()
     if not trade:
@@ -563,6 +573,7 @@ def edit_trade(trade_id: int):
         quantity_raw = request.form.get('quantity', '').strip()
         price_raw = request.form.get('price', '').strip()
         fee_raw = request.form.get('fee', '').strip()
+        stamp_raw = request.form.get('stamp_tax', '').strip()
         asset_type = request.form.get('asset_type', 'stock').strip().lower()
 
         upper_symbol = symbol_input.upper()
@@ -594,10 +605,15 @@ def edit_trade(trade_id: int):
         except ValueError:
             flash('手续费需为数字。', 'error')
             return redirect(url_for('edit_trade', trade_id=trade_id))
+        try:
+            stamp_tax = float(stamp_raw) if stamp_raw else 0.0
+        except ValueError:
+            flash('印花税需为数字。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
 
         db.execute(
-            'UPDATE trade_logs SET trade_date=?, symbol=?, action=?, quantity=?, price=?, fee=?, asset_type=?, note=NULL WHERE id=? AND user_id=?',
-            (trade_date, normalized_symbol, action, quantity, price, fee, asset_type, trade_id, current_user.id),
+            'UPDATE trade_logs SET trade_date=?, symbol=?, action=?, quantity=?, price=?, fee=?, stamp_tax=?, asset_type=?, note=NULL WHERE id=? AND user_id=?',
+            (trade_date, normalized_symbol, action, quantity, price, fee, stamp_tax, asset_type, trade_id, current_user.id),
         )
         db.commit()
         flash('已更新交易。', 'success')
@@ -633,7 +649,7 @@ def portfolio_view():
         start_date, end_date = end_date, start_date
 
     rows = db.execute(
-        'SELECT trade_date, symbol, action, quantity, price, fee, asset_type FROM trade_logs WHERE user_id = ? ORDER BY trade_date ASC, id ASC',
+        'SELECT trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type FROM trade_logs WHERE user_id = ? ORDER BY trade_date ASC, id ASC',
         (current_user.id,),
     ).fetchall()
     symbol_asset: Dict[str, str] = {}
