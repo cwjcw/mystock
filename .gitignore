@@ -220,3 +220,6 @@ data/*.rss
 # Proxy credentials / configs
 proxy_*.json
 proxy_*.txt
+
+# nohup output
+nohup.out
