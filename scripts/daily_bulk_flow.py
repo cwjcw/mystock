@@ -1,8 +1,11 @@
 import argparse
 import datetime as dt
+import json
 import os
+import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -30,13 +33,33 @@ EM_HEADERS = {
         "Chrome/114.0.0.0 Safari/537.36"
     ),
 }
+# 仅查询沪深 A 股（含创业板、科创板），剔除指数、债券等无日度资金流数据的标的
+EM_FS_FILTERS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
 SESSION = requests.Session()
 SESSION.trust_env = False
+
+
+LOG_PATH = Path(__file__).resolve().parents[1] / "bulk.log"
+LOGGER = logging.getLogger("daily_bulk_flow")
+if not LOGGER.handlers:
+    LOGGER.setLevel(logging.INFO)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOGGER.addHandler(handler)
+    except OSError:
+        # 如果日志目录无法创建，退回到默认配置但不阻塞任务
+        logging.basicConfig(level=logging.INFO)
+    if LOGGER.handlers:
+        LOGGER.propagate = False
 
 
 PROXY_API_URL = None
 PROXY_USERNAME = None
 PROXY_PASSWORD = None
+PROXY_REFRESH_INTERVAL = 900
+_proxy_timestamp: Optional[float] = None
 
 
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
@@ -50,10 +73,23 @@ if ENV_FILE.exists():
 PROXY_API_URL = os.getenv("PROXY_API_URL")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+if os.getenv("PROXY_REFRESH_INTERVAL"):
+    try:
+        PROXY_REFRESH_INTERVAL = int(os.getenv("PROXY_REFRESH_INTERVAL"))
+    except ValueError:
+        pass
+BULK_WORKERS_DEFAULT = 20
+if os.getenv("BULK_WORKERS"):
+    try:
+        BULK_WORKERS_DEFAULT = max(1, int(os.getenv("BULK_WORKERS")))
+    except ValueError:
+        pass
+CODE_CACHE_PATH = Path(__file__).resolve().parents[1] / 'data' / 'all_codes.json'
 
 
 def _refresh_proxy():
     """(Re)configure SESSION proxies using the configured API."""
+    global _proxy_timestamp
     if not PROXY_API_URL:
         return
     try:
@@ -68,19 +104,38 @@ def _refresh_proxy():
         proxy_auth = proxy_ip
     proxy_url = f"http://{proxy_auth}/"
     SESSION.proxies.update({"http": proxy_url, "https": proxy_url})
+    _proxy_timestamp = time.monotonic()
+
+
+def _ensure_proxy():
+    if not PROXY_API_URL:
+        return
+    global _proxy_timestamp
+    now = time.monotonic()
+    if _proxy_timestamp is None or (now - _proxy_timestamp) > PROXY_REFRESH_INTERVAL:
+        _refresh_proxy()
 
 
 _refresh_proxy()
 
 
-def fetch_all_stock_codes() -> List[str]:
-    """Fetch all A-share 6-digit codes (both SH and SZ)."""
+def fetch_all_stock_codes(force_refresh: bool = False) -> List[str]:
+    """Fetch all A-share stock codes (沪深、北交等)。"""
+    if not force_refresh and CODE_CACHE_PATH.exists():
+        try:
+            data = json.loads(CODE_CACHE_PATH.read_text(encoding='utf-8'))
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+
     codes: List[str] = []
     pn = 1
     while True:
+        _ensure_proxy()
         url = (
             "https://push2.eastmoney.com/api/qt/clist/get?"
-            f"pn={pn}&pz=500&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:0,m:1&fields=f12"
+            f"pn={pn}&pz=500&po=1&np=1&fltt=2&invt=2&fid=f3&fs={EM_FS_FILTERS}&fields=f12"
         )
         delay = 1.0
         for attempt in range(5):
@@ -106,6 +161,11 @@ def fetch_all_stock_codes() -> List[str]:
             break
     # de-dup
     codes = sorted(set(codes))
+    try:
+        CODE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CODE_CACHE_PATH.write_text(json.dumps(codes, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
     return codes
 
 
@@ -114,39 +174,74 @@ def run_for_date(
     the_date: Optional[str] = None,
     limit: Optional[int] = None,
     codes_override: Optional[List[str]] = None,
+    workers: int = BULK_WORKERS_DEFAULT,
+    force_refresh: bool = False,
 ):
     start_time = time.perf_counter()
-    codes = codes_override or fetch_all_stock_codes()
+    _ensure_proxy()
+    codes = codes_override or fetch_all_stock_codes(force_refresh=force_refresh)
     if limit:
         codes = codes[:limit]
     results: List[Dict] = []
-    for code in codes:
-        try:
-            flows = fetch_fund_flow_dayk(code, start=the_date, end=the_date)
-            if not flows:
-                continue
-            base = fetch_basic_info(code)
-            for f in flows:
-                results.append({**base, **f})
-        except Exception:
-            continue
+    proxies = SESSION.proxies.copy()
+    date_label = the_date or dt.date.today().strftime("%Y-%m-%d")
+    print(f"正在读取 {date_label} …")
+
+    def _worker(code: str) -> List[Dict]:
+        last_exc: Optional[Exception] = None
+        missing_data = False
+        for attempt in range(3):
+            sess = requests.Session()
+            sess.trust_env = False
+            sess.headers.update(EM_HEADERS)
+            if proxies and attempt == 0:
+                sess.proxies.update(proxies)
+            try:
+                flows = fetch_fund_flow_dayk(code, start=the_date, end=the_date, session=sess)
+                if not flows:
+                    missing_data = True
+                    break
+                base = fetch_basic_info(code, session=sess)
+                return [{**base, **f} for f in flows]
+            except Exception as exc:  # retry on transient HTTP/parse issues
+                last_exc = exc
+                time.sleep(1 + attempt)
+            finally:
+                sess.close()
+        if missing_data:
+            LOGGER.warning("no flow data returned for %s on %s", code, the_date)
+        elif last_exc is not None:
+            LOGGER.warning("failed to fetch %s for %s: %s", code, the_date, last_exc)
+        return []
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {executor.submit(_worker, code): code for code in codes}
+        for future in as_completed(futures):
+            batch = future.result()
+            if batch:
+                results.extend(batch)
     if results:
         save_to_sqlite(results, db_path)
     elapsed = time.perf_counter() - start_time
-    date_label = the_date or dt.date.today().strftime("%Y-%m-%d")
     print(
         f"run_for_date({date_label}) processed {len(results)} records in {elapsed:.2f}s"
     )
     _refresh_proxy()
 
 
-def run_full_range(db_path: str, end_date_str: str, limit: Optional[int] = None):
+def run_full_range(
+    db_path: str,
+    end_date_str: str,
+    limit: Optional[int] = None,
+    workers: int = BULK_WORKERS_DEFAULT,
+    force_refresh_codes: bool = False,
+):
     try:
         end_date = dt.datetime.strptime(end_date_str, "%Y-%m-%d").date()
     except ValueError as exc:
         raise SystemExit(f"Invalid end date format: {end_date_str}") from exc
 
-    codes = fetch_all_stock_codes()
+    codes = fetch_all_stock_codes(force_refresh=force_refresh_codes)
     if limit:
         codes = codes[:limit]
     if not codes:
@@ -164,8 +259,60 @@ def run_full_range(db_path: str, end_date_str: str, limit: Optional[int] = None)
     current = start_date
     while current <= end_date:
         if is_trading_day(current):
-            run_for_date(db_path, current.strftime("%Y-%m-%d"), limit=limit, codes_override=codes)
+            run_for_date(
+                db_path,
+                current.strftime("%Y-%m-%d"),
+                limit=limit,
+                codes_override=codes,
+                workers=workers,
+            )
         current += dt.timedelta(days=1)
+
+
+def run_full_history(
+    db_path: str,
+    limit: Optional[int] = None,
+    workers: int = BULK_WORKERS_DEFAULT,
+    force_refresh_codes: bool = False,
+):
+    _ensure_proxy()
+    codes = fetch_all_stock_codes(force_refresh=force_refresh_codes)
+    if limit:
+        codes = codes[:limit]
+    total = len(codes)
+    proxies = SESSION.proxies.copy()
+
+    def _worker(code: str) -> List[Dict]:
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.headers.update(EM_HEADERS)
+        if proxies:
+            sess.proxies.update(proxies)
+        try:
+            flows = fetch_fund_flow_dayk(code, session=sess)
+            if not flows:
+                return []
+            base = fetch_basic_info(code, session=sess)
+            return [{**base, **f} for f in flows]
+        except Exception:
+            return []
+        finally:
+            sess.close()
+
+    batch: List[Dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {executor.submit(_worker, code): code for code in codes}
+        for idx, future in enumerate(as_completed(futures), 1):
+            data = future.result()
+            if data:
+                batch.extend(data)
+            if batch and len(batch) > 2000:
+                save_to_sqlite(batch, db_path)
+                batch.clear()
+            if idx % 200 == 0:
+                print(f"Fetched {idx}/{total} stocks...")
+    if batch:
+        save_to_sqlite(batch, db_path)
 
 
 def is_trading_day(d: dt.date) -> bool:
@@ -203,17 +350,41 @@ def main():
         "--fill-to",
         help="Fetch from earliest available date up to YYYY-MM-DD",
     )
+    parser.add_argument(
+        "--full-history",
+        action="store_true",
+        help="Fetch complete history for all codes in one pass",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Number of concurrent workers (default 20)",
+    )
+    parser.add_argument(
+        "--refresh-codes",
+        action="store_true",
+        help="Force refresh cached stock code list",
+    )
     args = parser.parse_args()
 
-    if args.fill_to:
-        run_full_range(args.db, args.fill_to, limit=args.limit)
+    workers = max(1, args.workers or BULK_WORKERS_DEFAULT)
+    if args.full_history:
+        run_full_history(args.db, limit=args.limit, workers=workers, force_refresh_codes=args.refresh_codes)
+    elif args.fill_to:
+        run_full_range(args.db, args.fill_to, limit=args.limit, workers=workers, force_refresh_codes=args.refresh_codes)
     elif args.date:
-        run_for_date(args.db, the_date=args.date, limit=args.limit)
+        run_for_date(args.db, the_date=args.date, limit=args.limit, workers=workers, force_refresh=args.refresh_codes)
     elif args.schedule:
         scheduler_loop(args.db)
     else:
         # default: run once for today
-        run_for_date(args.db, the_date=dt.date.today().strftime("%Y-%m-%d"), limit=args.limit)
+        run_for_date(
+            args.db,
+            the_date=dt.date.today().strftime("%Y-%m-%d"),
+            limit=args.limit,
+            workers=workers,
+            force_refresh=args.refresh_codes,
+        )
 
 
 if __name__ == "__main__":

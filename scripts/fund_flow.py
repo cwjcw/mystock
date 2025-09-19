@@ -37,7 +37,7 @@ def normalize_code(code: str) -> str:
     raise ValueError(f"Unrecognized stock code: {code}")
 
 
-def fetch_basic_info(code: str) -> Dict:
+def fetch_basic_info(code: str, session: Optional[requests.Session] = None) -> Dict:
     """
     Fetch basic quote and market cap info from Eastmoney.
     Returns keys: name, code, exchange, price, change, change_pct, market_cap, float_market_cap.
@@ -47,7 +47,8 @@ def fetch_basic_info(code: str) -> Dict:
         "https://push2.eastmoney.com/api/qt/stock/get?"
         "fields=f58,f116,f117,f43,f170,f169,f152&secid=" + secid
     )
-    r = SESSION.get(url, headers=EM_REFERER, timeout=DEFAULT_TIMEOUT)
+    sess = session or SESSION
+    r = sess.get(url, headers=EM_REFERER, timeout=DEFAULT_TIMEOUT)
     r.raise_for_status()
     data = r.json().get("data") or {}
     name = data.get("f58")
@@ -73,6 +74,7 @@ def fetch_fund_flow_dayk(
     code: str,
     start: Optional[str] = None,
     end: Optional[str] = None,
+    session: Optional[requests.Session] = None,
 ) -> List[Dict]:
     """
     Fetch daily funds flow breakdown (main, ultra-large, large, medium, small) from Eastmoney.
@@ -81,12 +83,22 @@ def fetch_fund_flow_dayk(
     """
     secid = normalize_code(code)
     # Use historical endpoint which works without ut when Referer is set
-    url = (
-        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?"
-        "fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58&"
-        f"lmt=0&klt=101&secid={secid}"
-    )
-    r = SESSION.get(url, headers=EM_REFERER, timeout=DEFAULT_TIMEOUT)
+    params = [
+        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?",
+        "fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58",
+    ]
+
+    if start:
+        params.append(f"beg={start.replace('-', '')}")
+    if end:
+        params.append(f"end={end.replace('-', '')}")
+    params.append("lmt=0")
+
+    params.append("klt=101")
+    params.append(f"secid={secid}")
+    url = "&".join(params)
+    sess = session or SESSION
+    r = sess.get(url, headers=EM_REFERER, timeout=DEFAULT_TIMEOUT)
     r.raise_for_status()
     j = r.json()
     data = (j.get("data") or {}).get("klines") or []

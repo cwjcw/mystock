@@ -67,6 +67,14 @@ python scripts/daily_bulk_flow.py --db data/stocks.db --schedule
 python scripts/daily_bulk_flow.py --db data/stocks.db --fill-to 2025-09-15
 ```
   - 脚本会自动判断东方财富最早能提供的数据日期，并在抓取每个交易日后刷新一次代理 IP。
+- 一次性抓取所有历史数据（谨慎使用，耗时较长）：
+```
+python scripts/daily_bulk_flow.py --db data/stocks.db --full-history
+```
+  - 逐只股票下载全部历史资金流记录，并批量写入数据库。
+- 可选参数：
+  - `--workers 20` 调整并发抓取数量，默认 20（可通过 `.env` 的 `BULK_WORKERS` 覆盖）
+  - `--refresh-codes` 强制刷新本地缓存的股票代码列表（默认缓存于 `data/all_codes.json`）
 
 ## 多用户 Web（登录配置 + 每用户 RSS）
 - 启动服务（端口 18888）：
@@ -92,6 +100,8 @@ python web/app.py
 
 ### 代理
 - 在 `.env` 中配置 `PROXY_API_URL`、`PROXY_USERNAME`、`PROXY_PASSWORD` 后，日终抓取脚本会自动向代理服务拉取 IP 并定期刷新。
+  - 可额外设置 `PROXY_REFRESH_INTERVAL`（秒），默认每 900 秒（15 分钟）更新一次。
+  - `BULK_WORKERS` 可设置默认并发数（默认 20）。
 
 ## .env 配置（项目根目录）
 启动时自动读取 `.env`（也可用进程环境变量覆盖），示例：
