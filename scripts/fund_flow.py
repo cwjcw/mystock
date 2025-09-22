@@ -4,121 +4,140 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
+import akshare as ak
 import requests
 
 
-EM_REFERER = {"Referer": "https://quote.eastmoney.com/"}
-SESSION = requests.Session()
-# Default: avoid system proxy unless explicitly enabled via CLI
-SESSION.trust_env = False
-DEFAULT_TIMEOUT = 10
+T = TypeVar("T")
 
 
-def normalize_code(code: str) -> str:
-    """
-    Normalize input stock code to eastmoney secid format: "1.600519" or "0.000001".
-    Accepts forms like "600519", "sh600519", "sz000001".
-    """
-    c = code.strip().lower()
-    if c.startswith("sh"):
-        return f"1.{c[2:]}"
-    if c.startswith("sz"):
-        return f"0.{c[2:]}"
-    # Infer by leading digits
-    if c.startswith(("600", "601", "603", "605", "688")):
-        return f"1.{c}"
-    elif c.startswith(("000", "001", "002", "003", "300", "301")):
-        return f"0.{c}"
-    # Fallback: assume 6-digit SH if unknown
-    if len(c) == 6 and c.isdigit():
-        return f"1.{c}"
-    raise ValueError(f"Unrecognized stock code: {code}")
+def _has_proxy_env() -> bool:
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+        if os.environ.get(key):
+            return True
+    return False
 
 
-def fetch_basic_info(code: str, session: Optional[requests.Session] = None) -> Dict:
-    """
-    Fetch basic quote and market cap info from Eastmoney.
-    Returns keys: name, code, exchange, price, change, change_pct, market_cap, float_market_cap.
-    """
-    secid = normalize_code(code)
-    url = (
-        "https://push2.eastmoney.com/api/qt/stock/get?"
-        "fields=f58,f116,f117,f43,f170,f169,f152&secid=" + secid
-    )
-    sess = session or SESSION
-    r = sess.get(url, headers=EM_REFERER, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-    data = r.json().get("data") or {}
-    name = data.get("f58")
-    price = (data.get("f43") or 0) / 100.0
-    change = (data.get("f169") or 0) / 100.0
-    change_pct = (data.get("f170") or 0) / 100.0
-    market_cap = data.get("f116")  # RMB
-    float_market_cap = data.get("f117")  # RMB
-    exch = "SH" if secid.startswith("1.") else "SZ"
-    return {
-        "code": secid.split(".")[1],
-        "exchange": exch,
-        "name": name,
-        "price": price,
-        "change": change,
-        "change_pct": change_pct,
-        "market_cap": market_cap,
-        "float_market_cap": float_market_cap,
-    }
+def _disable_proxies() -> None:
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+        os.environ.pop(key, None)
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+    os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
+
+
+def _call_with_proxy_retry(fn: Callable[[], T], description: str) -> T:
+    try:
+        return fn()
+    except requests.exceptions.ProxyError:
+        if _has_proxy_env():
+            print(f"检测到代理访问 {description} 失败，自动禁用代理后重试…")
+            _disable_proxies()
+            return fn()
+        raise
+    except requests.exceptions.RequestException:
+        if _has_proxy_env():
+            print(f"访问 {description} 出现网络异常，自动禁用代理后重试…")
+            _disable_proxies()
+            return fn()
+        raise
+
+
+def parse_stock_code(code: str) -> Tuple[str, str, str]:
+    """Return (stock, market, exchange) for AKShare interfaces."""
+    raw = code.strip()
+    if not raw:
+        raise ValueError("Empty stock code")
+
+    stock: Optional[str] = None
+    exchange: Optional[str] = None
+
+    if "." in raw:
+        parts = raw.split(".")
+        if len(parts) != 2:
+            raise ValueError(f"Unrecognized stock code: {code}")
+        stock_part, exch_part = parts
+        stock = stock_part[-6:]
+        exchange = exch_part.upper()
+    else:
+        lowered = raw.lower()
+        if lowered.startswith("sh") or lowered.startswith("sz") or lowered.startswith("bj"):
+            exchange = lowered[:2].upper()
+            stock = raw[2:][-6:]
+        else:
+            cleaned = raw[-6:]
+            if not cleaned.isdigit():
+                raise ValueError(f"Unrecognized stock code: {code}")
+            stock = cleaned
+            if cleaned.startswith(("600", "601", "603", "605", "688")):
+                exchange = "SH"
+            elif cleaned.startswith(("000", "001", "002", "003", "300", "301")):
+                exchange = "SZ"
+            elif cleaned.startswith(("430", "688", "830", "831", "833", "835", "836", "838", "839", "870", "871", "872")):
+                exchange = "BJ"
+            else:
+                exchange = "SH"
+
+    if not stock or len(stock) != 6 or not stock.isdigit():
+        raise ValueError(f"Unrecognized stock code: {code}")
+    if exchange not in {"SH", "SZ", "BJ"}:
+        raise ValueError(f"Unsupported exchange for code {code}")
+
+    market_map = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
+    return stock, market_map[exchange], exchange
 
 
 def fetch_fund_flow_dayk(
     code: str,
     start: Optional[str] = None,
     end: Optional[str] = None,
-    session: Optional[requests.Session] = None,
 ) -> List[Dict]:
     """
-    Fetch daily funds flow breakdown (main, ultra-large, large, medium, small) from Eastmoney.
-    Returns list of dicts with keys: date, main, ultra_large, large, medium, small, pct_chg.
-    start/end are strings YYYY-MM-DD (inclusive). If omitted, returns all available and caller filters.
+    Fetch daily funds flow via AKShare stock_individual_fund_flow.
+    Returns list of dicts per trading day containing flow metrics (单位: 元 / %).
     """
-    secid = normalize_code(code)
-    # Use historical endpoint which works without ut when Referer is set
-    params = [
-        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?",
-        "fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58",
-    ]
+    stock, market, exchange = parse_stock_code(code)
+    df = _call_with_proxy_retry(
+        lambda: ak.stock_individual_fund_flow(stock=stock, market=market),
+        description="AKShare stock_individual_fund_flow",
+    )
+    if df is None or df.empty:
+        return []
 
+    df = df.copy()
+    df["日期"] = df["日期"].astype(str)
     if start:
-        params.append(f"beg={start.replace('-', '')}")
+        df = df[df["日期"] >= start]
     if end:
-        params.append(f"end={end.replace('-', '')}")
-    params.append("lmt=0")
+        df = df[df["日期"] <= end]
 
-    params.append("klt=101")
-    params.append(f"secid={secid}")
-    url = "&".join(params)
-    sess = session or SESSION
-    r = sess.get(url, headers=EM_REFERER, timeout=DEFAULT_TIMEOUT)
-    r.raise_for_status()
-    j = r.json()
-    data = (j.get("data") or {}).get("klines") or []
-    rows: List[Dict] = []
-    for line in data:
-        parts = line.split(",")
-        if len(parts) < 8:
-            continue
-        d, main, ultra, large, medium, small, pct_chg, _last = parts[:8]
-        rows.append(
+    df = df.sort_values("日期")
+
+    records: List[Dict] = []
+    for row in df.to_dict(orient="records"):
+        records.append(
             {
-                "date": d,
-                "main": float(main),
-                "ultra_large": float(ultra),
-                "large": float(large),
-                "medium": float(medium),
-                "small": float(small),
-                "pct_chg": float(pct_chg),
+                "code": stock,
+                "exchange": exchange,
+                "date": row.get("日期"),
+                "close": row.get("收盘价"),
+                "pct_chg": row.get("涨跌幅"),
+                "main": row.get("主力净流入-净额"),
+                "main_ratio": row.get("主力净流入-净占比"),
+                "ultra_large": row.get("超大单净流入-净额"),
+                "ultra_large_ratio": row.get("超大单净流入-净占比"),
+                "large": row.get("大单净流入-净额"),
+                "large_ratio": row.get("大单净流入-净占比"),
+                "medium": row.get("中单净流入-净额"),
+                "medium_ratio": row.get("中单净流入-净占比"),
+                "small": row.get("小单净流入-净额"),
+                "small_ratio": row.get("小单净流入-净占比"),
             }
         )
+
+    return records
+
     # Filter by date range if provided
     def to_date(s: str) -> dt.date:
         return dt.datetime.strptime(s, "%Y-%m-%d").date()
@@ -141,44 +160,17 @@ def earliest_fund_flow_date(code: str) -> Optional[str]:
     return min(r["date"] for r in rows)
 
 
-def merge_latest_on_date(code: str, date: Optional[str]) -> Dict:
-    """
-    Return a single merged record for the specified date (or the latest if date is None):
-    Includes basic info and fund flow figures for that date.
-    """
-    base = fetch_basic_info(code)
-    flows = fetch_fund_flow_dayk(code, start=date, end=date) if date else fetch_fund_flow_dayk(code)
-    flow = None
-    if date:
-        flow = flows[0] if flows else None
-    else:
-        flow = flows[-1] if flows else None
-    result = {
-        **base,
-        "date": (flow or {}).get("date"),
-        "main": (flow or {}).get("main"),
-        "ultra_large": (flow or {}).get("ultra_large"),
-        "large": (flow or {}).get("large"),
-        "medium": (flow or {}).get("medium"),
-        "small": (flow or {}).get("small"),
-        "pct_chg": (flow or {}).get("pct_chg", base.get("change_pct")),
-    }
-    return result
-
-
 def _init_db(conn: sqlite3.Connection):
-    # 使用中文列名，并使用双引号包裹以确保兼容性
+    # 资金流表 + 基本信息表（雪球字段）
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS stock_basics (
+        CREATE TABLE IF NOT EXISTS stock_basic_info_xq (
             "代码" TEXT NOT NULL,
             "交易所" TEXT NOT NULL,
-            "名称" TEXT,
-            "最新价" REAL,
-            "总市值" REAL,
-            "流通市值" REAL,
+            "字段" TEXT NOT NULL,
+            "值" TEXT,
             "更新时间" TEXT,
-            PRIMARY KEY ("代码", "交易所")
+            PRIMARY KEY ("代码", "交易所", "字段")
         )
         """
     )
@@ -188,106 +180,210 @@ def _init_db(conn: sqlite3.Connection):
             "代码" TEXT NOT NULL,
             "交易所" TEXT NOT NULL,
             "日期" TEXT NOT NULL,
-            "主力" REAL,
-            "超大单" REAL,
-            "大单" REAL,
-            "中单" REAL,
-            "小单" REAL,
+            "收盘价" REAL,
             "涨跌幅" REAL,
+            "主力净流入-净额" REAL,
+            "主力净流入-净占比" REAL,
+            "超大单净流入-净额" REAL,
+            "超大单净流入-净占比" REAL,
+            "大单净流入-净额" REAL,
+            "大单净流入-净占比" REAL,
+            "中单净流入-净额" REAL,
+            "中单净流入-净占比" REAL,
+            "小单净流入-净额" REAL,
+            "小单净流入-净占比" REAL,
+            "名称" TEXT,
             PRIMARY KEY ("代码", "交易所", "日期")
         )
         """
     )
+
     cols = {row[1] for row in conn.execute('PRAGMA table_info("fund_flow_daily")')}
-    if "名称" not in cols:
-        conn.execute('ALTER TABLE fund_flow_daily ADD COLUMN "名称" TEXT')
-    if "总市值" not in cols:
-        conn.execute('ALTER TABLE fund_flow_daily ADD COLUMN "总市值" REAL')
+    rename_map = {
+        "主力": "主力净流入-净额",
+        "超大单": "超大单净流入-净额",
+        "大单": "大单净流入-净额",
+        "中单": "中单净流入-净额",
+        "小单": "小单净流入-净额",
+    }
+    for old, new in rename_map.items():
+        if old in cols and new not in cols:
+            conn.execute(f'ALTER TABLE fund_flow_daily RENAME COLUMN "{old}" TO "{new}"')
+
+    def _drop_column(column: str) -> None:
+        try:
+            conn.execute(f'ALTER TABLE fund_flow_daily DROP COLUMN "{column}"')
+        except sqlite3.OperationalError:
+            pass
+
+    # Remove obsolete columns if they still exist
+    _drop_column("总市值")
+    _drop_column("最新价")
+
+    cols = {row[1] for row in conn.execute('PRAGMA table_info("fund_flow_daily")')}
+    required_cols = {
+        "收盘价": "REAL",
+        "涨跌幅": "REAL",
+        "主力净流入-净额": "REAL",
+        "主力净流入-净占比": "REAL",
+        "超大单净流入-净额": "REAL",
+        "超大单净流入-净占比": "REAL",
+        "大单净流入-净额": "REAL",
+        "大单净流入-净占比": "REAL",
+        "中单净流入-净额": "REAL",
+        "中单净流入-净占比": "REAL",
+        "小单净流入-净额": "REAL",
+        "小单净流入-净占比": "REAL",
+        "名称": "TEXT",
+    }
+    for col, col_type in required_cols.items():
+        if col not in cols:
+            conn.execute(f'ALTER TABLE fund_flow_daily ADD COLUMN "{col}" {col_type}')
+
+def fetch_basic_profile(
+    code: str,
+    *,
+    token: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> Dict[str, str]:
+    stock, _market, exchange = parse_stock_code(code)
+    symbol = f"{exchange}{stock}"
+    try:
+        df = _call_with_proxy_retry(
+            lambda: ak.stock_individual_basic_info_xq(symbol=symbol, token=token, timeout=timeout),
+            description="AKShare stock_individual_basic_info_xq",
+        )
+    except Exception:
+        return {}
+    if df is None or df.empty:
+        return {}
+    profile = {}
+    for record in df.to_dict(orient="records"):
+        item = str(record.get("item"))
+        value = record.get("value")
+        profile[item] = "" if value is None else str(value)
+    return profile
 
 
-def save_to_sqlite(results: List[Dict], db_path: str):
-    # Ensure directory exists
+def extract_stock_name(profile: Dict[str, str]) -> Optional[str]:
+    preferred_keys = [
+        "org_short_name_cn",
+        "org_name_cn",
+        "org_short_name_en",
+        "org_name_en",
+    ]
+    for key in preferred_keys:
+        if profile.get(key):
+            return profile[key]
+    return None
+
+
+def save_to_sqlite(
+    flows: Iterable[Dict],
+    profiles: Dict[Tuple[str, str], Dict[str, str]],
+    db_path: str,
+):
+    flow_list = list(flows)
+    if not flow_list and not profiles:
+        return
+
     p = Path(db_path)
     if p.parent and not p.parent.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
+
     conn = sqlite3.connect(str(p))
     try:
         _init_db(conn)
         now_iso = dt.datetime.now().isoformat(timespec="seconds")
-        # Upsert basics
-        def sc(x):
-            return round(float(x) / 1e8, 2) if x is not None else None
-        basics_rows = [
-            (
-                r.get("code"),
-                r.get("exchange"),
-                r.get("name"),
-                r.get("price"),
-                sc(r.get("market_cap")),
-                sc(r.get("float_market_cap")),
-                now_iso,
-            )
-            for r in results
-        ]
-        conn.executemany(
-            """
-            INSERT INTO stock_basics ("代码","交易所","名称","最新价","总市值","流通市值","更新时间")
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT("代码","交易所") DO UPDATE SET
-                "名称"=excluded."名称",
-                "最新价"=excluded."最新价",
-                "总市值"=excluded."总市值",
-                "流通市值"=excluded."流通市值",
-                "更新时间"=excluded."更新时间"
-            """,
-            basics_rows,
-        )
 
-        # Upsert fund flow per date if present
-        flow_rows = []
-        for r in results:
-            if not r.get("date"):
-                continue
-            # scale to 亿元 with 2 decimals
-            def sc(x):
-                return round(float(x) / 1e8, 2) if x is not None else None
-            market_cap_scaled = sc(r.get("market_cap"))
+        if profiles:
+            basic_rows = []
+            for (code, exchange), data in profiles.items():
+                for field, value in data.items():
+                    basic_rows.append((code, exchange, field, value, now_iso))
+            if basic_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO stock_basic_info_xq ("代码","交易所","字段","值","更新时间")
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT("代码","交易所","字段") DO UPDATE SET
+                        "值"=excluded."值",
+                        "更新时间"=excluded."更新时间"
+                    """,
+                    basic_rows,
+                )
+
+        def to_float(val: Optional[float]) -> Optional[float]:
+            if val is None:
+                return None
             try:
-                pct = float(r.get("pct_chg"))
+                return float(val)
             except (TypeError, ValueError):
-                pct = None
-            if pct is not None:
-                pct = round(pct, 2)
+                return None
+
+        def to_pct(val: Optional[float]) -> Optional[float]:
+            fval = to_float(val)
+            if fval is None:
+                return None
+            return round(fval, 2)
+
+        def to_amount(val: Optional[float]) -> Optional[float]:
+            fval = to_float(val)
+            if fval is None:
+                return None
+            return round(fval / 1e8, 4)
+
+        flow_rows = []
+        for row in flow_list:
+            if not row.get("date"):
+                continue
             flow_rows.append(
                 (
-                    r.get("code"),
-                    r.get("exchange"),
-                    r.get("date"),
-                    sc(r.get("main")),
-                    sc(r.get("ultra_large")),
-                    sc(r.get("large")),
-                    sc(r.get("medium")),
-                    sc(r.get("small")),
-                    pct,
-                    r.get("name"),
-                    market_cap_scaled,
+                    row.get("code"),
+                    row.get("exchange"),
+                    row.get("date"),
+                    to_float(row.get("close")),
+                    to_pct(row.get("pct_chg")),
+                    to_amount(row.get("main")),
+                    to_pct(row.get("main_ratio")),
+                    to_amount(row.get("ultra_large")),
+                    to_pct(row.get("ultra_large_ratio")),
+                    to_amount(row.get("large")),
+                    to_pct(row.get("large_ratio")),
+                    to_amount(row.get("medium")),
+                    to_pct(row.get("medium_ratio")),
+                    to_amount(row.get("small")),
+                    to_pct(row.get("small_ratio")),
+                    row.get("name"),
                 )
             )
+
         if flow_rows:
             conn.executemany(
                 """
                 INSERT INTO fund_flow_daily (
-                    "代码","交易所","日期","主力","超大单","大单","中单","小单","涨跌幅","名称","总市值"
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "代码","交易所","日期","收盘价","涨跌幅",
+                    "主力净流入-净额","主力净流入-净占比",
+                    "超大单净流入-净额","超大单净流入-净占比",
+                    "大单净流入-净额","大单净流入-净占比",
+                    "中单净流入-净额","中单净流入-净占比",
+                    "小单净流入-净额","小单净流入-净占比",
+                    "名称"
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT("代码","交易所","日期") DO UPDATE SET
-                    "主力"=excluded."主力",
-                    "超大单"=excluded."超大单",
-                    "大单"=excluded."大单",
-                    "中单"=excluded."中单",
-                    "小单"=excluded."小单",
+                    "收盘价"=excluded."收盘价",
                     "涨跌幅"=excluded."涨跌幅",
-                    "名称"=excluded."名称",
-                    "总市值"=excluded."总市值"
+                    "主力净流入-净额"=excluded."主力净流入-净额",
+                    "主力净流入-净占比"=excluded."主力净流入-净占比",
+                    "超大单净流入-净额"=excluded."超大单净流入-净额",
+                    "超大单净流入-净占比"=excluded."超大单净流入-净占比",
+                    "大单净流入-净额"=excluded."大单净流入-净额",
+                    "大单净流入-净占比"=excluded."大单净流入-净占比",
+                    "中单净流入-净额"=excluded."中单净流入-净额",
+                    "中单净流入-净占比"=excluded."中单净流入-净占比",
+                    "小单净流入-净额"=excluded."小单净流入-净额",
+                    "小单净流入-净占比"=excluded."小单净流入-净占比",
+                    "名称"=excluded."名称"
                 """,
                 flow_rows,
             )
@@ -298,110 +394,135 @@ def save_to_sqlite(results: List[Dict], db_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch A-share fund flow and basics from Eastmoney")
-    parser.add_argument("codes", nargs="+", help="Stock codes like 600519, sh600519, sz000001")
+    parser = argparse.ArgumentParser(description="Fetch A-share fund flow via AKShare")
+    parser.add_argument("codes", nargs="+", help="Stock codes like 600519, sh600519, 000001.SZ")
     parser.add_argument("--date", dest="date", help="Specific date YYYY-MM-DD")
     parser.add_argument("--start", dest="start", help="Start date YYYY-MM-DD")
     parser.add_argument("--end", dest="end", help="End date YYYY-MM-DD")
-    parser.add_argument("--all-days", action="store_true", help="Output all days in range instead of latest")
+    parser.add_argument("--all-days", action="store_true", help="Output all days in range instead of only the latest")
     parser.add_argument("--json", action="store_true", help="Output JSON lines instead of table")
     parser.add_argument("--db", dest="db_path", help="SQLite file path to save results")
-    parser.add_argument("--use-proxy", action="store_true", help="Use system proxy settings (HTTP[S]_PROXY)")
-    parser.add_argument("--timeout", type=float, default=None, help="HTTP timeout seconds (default 10)")
+    parser.add_argument("--xq-token", dest="xq_token", help="Override Xueqiu token for basic info")
+    parser.add_argument("--timeout", type=float, default=None, help="Request timeout for Xueqiu basic info")
     parser.add_argument("--earliest", action="store_true", help="Only print earliest available date for each code")
     args = parser.parse_args()
 
-    # Configure session per CLI
-    if args.use_proxy:
-        SESSION.trust_env = True
-    if args.timeout is not None:
-        global DEFAULT_TIMEOUT
-        DEFAULT_TIMEOUT = args.timeout
+    start = args.start or args.date
+    end = args.end or args.date
 
     if args.earliest:
         for c in args.codes:
-            code_only = c[-6:] if len(c) > 6 else c
-            earliest = earliest_fund_flow_date(code_only)
+            earliest = earliest_fund_flow_date(c)
             print(f"{c}: earliest date = {earliest}")
         return
 
-    results: List[Dict] = []
-    for c in args.codes:
-        if args.all_days or args.start or args.end:
-            flows = fetch_fund_flow_dayk(c, start=args.start or args.date, end=args.end or args.date)
-            base = fetch_basic_info(c)
-            for f in flows:
-                results.append({**base, **f})
-        else:
-            results.append(merge_latest_on_date(c, args.date))
+    flows_for_output: List[Dict] = []
+    profile_map: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+    for code_input in args.codes:
+        stock, _market, exchange = parse_stock_code(code_input)
+        profile = fetch_basic_profile(code_input, token=args.xq_token, timeout=args.timeout)
+        profile_map[(stock, exchange)] = profile
+        name = extract_stock_name(profile)
+
+        flows = fetch_fund_flow_dayk(code_input, start=start, end=end)
+        if not args.all_days and not (start or end):
+            flows = flows[-1:] if flows else []
+
+        if not flows:
+            flows_for_output.append(
+                {
+                    "code": stock,
+                    "exchange": exchange,
+                    "date": start if start == end else None,
+                    "close": None,
+                    "pct_chg": None,
+                    "main": None,
+                    "main_ratio": None,
+                    "ultra_large": None,
+                    "ultra_large_ratio": None,
+                    "large": None,
+                    "large_ratio": None,
+                    "medium": None,
+                    "medium_ratio": None,
+                    "small": None,
+                    "small_ratio": None,
+                    "name": name,
+                }
+            )
+            continue
+
+        for f in flows:
+            flows_for_output.append({**f, "name": name})
 
     if args.db_path:
-        save_to_sqlite(results, args.db_path)
+        save_to_sqlite(flows_for_output, profile_map, args.db_path)
 
-    # 中文列名映射与输出
-    def _scale(v: Optional[float]) -> Optional[float]:
-        if v is None:
-            return None
+    def _to_float(value: Optional[float]) -> Optional[float]:
         try:
-            return round(float(v) / 1e8, 2)
-        except Exception:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
             return None
+
+    def _to_pct(value: Optional[float]) -> Optional[float]:
+        val = _to_float(value)
+        if val is None:
+            return None
+        return round(val, 2)
 
     def to_cn_record(r: Dict) -> Dict:
-        try:
-            pct = float(r.get("pct_chg")) if r.get("pct_chg") is not None else None
-        except (TypeError, ValueError):
-            pct = None
-        if pct is not None:
-            pct = round(pct, 2)
         return {
             "日期": r.get("date"),
             "代码": r.get("code"),
             "名称": r.get("name"),
             "交易所": r.get("exchange"),
-            "最新价": r.get("price"),
-            "涨跌幅": pct,
-            "总市值": _scale(r.get("market_cap")),
-            "主力": _scale(r.get("main")),
-            "超大单": _scale(r.get("ultra_large")),
-            "大单": _scale(r.get("large")),
-            "中单": _scale(r.get("medium")),
-            "小单": _scale(r.get("small")),
+            "收盘价": _to_float(r.get("close")),
+            "涨跌幅": _to_pct(r.get("pct_chg")),
+            "主力净流入-净额": _to_float(r.get("main")),
+            "主力净流入-净占比": _to_pct(r.get("main_ratio")),
+            "超大单净流入-净额": _to_float(r.get("ultra_large")),
+            "超大单净流入-净占比": _to_pct(r.get("ultra_large_ratio")),
+            "大单净流入-净额": _to_float(r.get("large")),
+            "大单净流入-净占比": _to_pct(r.get("large_ratio")),
+            "中单净流入-净额": _to_float(r.get("medium")),
+            "中单净流入-净占比": _to_pct(r.get("medium_ratio")),
+            "小单净流入-净额": _to_float(r.get("small")),
+            "小单净流入-净占比": _to_pct(r.get("small_ratio")),
         }
 
     if args.json:
-        for r in results:
+        for r in flows_for_output:
             print(json.dumps(to_cn_record(r), ensure_ascii=False))
         return
 
-    # Pretty table output
     cols = [
         "日期",
         "代码",
         "名称",
         "交易所",
-        "最新价",
+        "收盘价",
         "涨跌幅",
-        "总市值",
-        "主力",
-        "超大单",
-        "大单",
-        "中单",
-        "小单",
+        "主力净流入-净额",
+        "主力净流入-净占比",
+        "超大单净流入-净额",
+        "超大单净流入-净占比",
+        "大单净流入-净额",
+        "大单净流入-净占比",
+        "中单净流入-净额",
+        "中单净流入-净占比",
+        "小单净流入-净额",
+        "小单净流入-净占比",
     ]
     header = "\t".join(cols)
     print(header)
-    for r in results:
+    for r in flows_for_output:
         cn = to_cn_record(r)
         row = [cn.get(k, "") for k in cols]
-        # format numbers lightly
         out = []
         for k, v in zip(cols, row):
             if isinstance(v, float):
-                if k == "涨跌幅":
+                if k == "涨跌幅" or "占比" in k:
                     out.append(f"{v:.2f}%")
-                elif k in {"最新价"}:
-                    out.append(f"{v:.2f}")
                 else:
                     out.append(f"{v:.2f}")
             elif isinstance(v, (int,)):

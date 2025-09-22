@@ -7,7 +7,7 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 
@@ -15,14 +15,23 @@ import requests
 try:
     from scripts.fund_flow import (
         fetch_fund_flow_dayk,
-        fetch_basic_info,
         save_to_sqlite,
         earliest_fund_flow_date,
+        fetch_basic_profile,
+        extract_stock_name,
+        parse_stock_code,
     )  # type: ignore
 except ModuleNotFoundError:
     import os, sys
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
-    from fund_flow import fetch_fund_flow_dayk, fetch_basic_info, save_to_sqlite, earliest_fund_flow_date  # type: ignore
+    from fund_flow import (  # type: ignore
+        fetch_fund_flow_dayk,
+        save_to_sqlite,
+        earliest_fund_flow_date,
+        fetch_basic_profile,
+        extract_stock_name,
+        parse_stock_code,
+    )
 
 
 EM_HEADERS = {
@@ -182,49 +191,46 @@ def run_for_date(
     codes = codes_override or fetch_all_stock_codes(force_refresh=force_refresh)
     if limit:
         codes = codes[:limit]
-    results: List[Dict] = []
-    proxies = SESSION.proxies.copy()
+    flows_collected: List[Dict] = []
+    profile_map: Dict[Tuple[str, str], Dict[str, str]] = {}
     date_label = the_date or dt.date.today().strftime("%Y-%m-%d")
     print(f"正在读取 {date_label} …")
 
-    def _worker(code: str) -> List[Dict]:
+    def _worker(code: str) -> Tuple[List[Dict], Optional[Tuple[str, str, Dict[str, str]]]]:
         last_exc: Optional[Exception] = None
-        missing_data = False
         for attempt in range(3):
-            sess = requests.Session()
-            sess.trust_env = False
-            sess.headers.update(EM_HEADERS)
-            if proxies and attempt == 0:
-                sess.proxies.update(proxies)
             try:
-                flows = fetch_fund_flow_dayk(code, start=the_date, end=the_date, session=sess)
-                if not flows:
-                    missing_data = True
-                    break
-                base = fetch_basic_info(code, session=sess)
-                return [{**base, **f} for f in flows]
-            except Exception as exc:  # retry on transient HTTP/parse issues
+                flows = fetch_fund_flow_dayk(code, start=the_date, end=the_date)
+                profile = fetch_basic_profile(code)
+                stock, _market, exchange = parse_stock_code(code)
+                name = extract_stock_name(profile)
+                enriched = []
+                for item in flows:
+                    enriched.append({**item, "name": name})
+                if not enriched:
+                    LOGGER.warning("no flow data returned for %s on %s", code, the_date)
+                return enriched, (stock, exchange, profile)
+            except Exception as exc:
                 last_exc = exc
                 time.sleep(1 + attempt)
-            finally:
-                sess.close()
-        if missing_data:
-            LOGGER.warning("no flow data returned for %s on %s", code, the_date)
-        elif last_exc is not None:
+        if last_exc is not None:
             LOGGER.warning("failed to fetch %s for %s: %s", code, the_date, last_exc)
-        return []
+        return [], None
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(_worker, code): code for code in codes}
         for future in as_completed(futures):
-            batch = future.result()
+            batch, profile_entry = future.result()
+            if profile_entry is not None:
+                stock, exchange, profile = profile_entry
+                profile_map[(stock, exchange)] = profile
             if batch:
-                results.extend(batch)
-    if results:
-        save_to_sqlite(results, db_path)
+                flows_collected.extend(batch)
+    if flows_collected or profile_map:
+        save_to_sqlite(flows_collected, profile_map, db_path)
     elapsed = time.perf_counter() - start_time
     print(
-        f"run_for_date({date_label}) processed {len(results)} records in {elapsed:.2f}s"
+        f"run_for_date({date_label}) processed {len(flows_collected)} records in {elapsed:.2f}s"
     )
     _refresh_proxy()
 
@@ -280,39 +286,38 @@ def run_full_history(
     if limit:
         codes = codes[:limit]
     total = len(codes)
-    proxies = SESSION.proxies.copy()
 
-    def _worker(code: str) -> List[Dict]:
-        sess = requests.Session()
-        sess.trust_env = False
-        sess.headers.update(EM_HEADERS)
-        if proxies:
-            sess.proxies.update(proxies)
+    def _worker(code: str) -> Tuple[List[Dict], Optional[Tuple[str, str, Dict[str, str]]]]:
         try:
-            flows = fetch_fund_flow_dayk(code, session=sess)
-            if not flows:
-                return []
-            base = fetch_basic_info(code, session=sess)
-            return [{**base, **f} for f in flows]
-        except Exception:
-            return []
-        finally:
-            sess.close()
+            flows = fetch_fund_flow_dayk(code)
+            profile = fetch_basic_profile(code)
+            stock, _market, exchange = parse_stock_code(code)
+            name = extract_stock_name(profile)
+            enriched = [{**item, "name": name} for item in flows]
+            return enriched, (stock, exchange, profile)
+        except Exception as exc:
+            LOGGER.warning("failed to fetch history for %s: %s", code, exc)
+            return [], None
 
-    batch: List[Dict] = []
+    flows_batch: List[Dict] = []
+    profile_batch: Dict[Tuple[str, str], Dict[str, str]] = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(_worker, code): code for code in codes}
         for idx, future in enumerate(as_completed(futures), 1):
-            data = future.result()
+            data, profile_entry = future.result()
+            if profile_entry is not None:
+                stock, exchange, profile = profile_entry
+                profile_batch[(stock, exchange)] = profile
             if data:
-                batch.extend(data)
-            if batch and len(batch) > 2000:
-                save_to_sqlite(batch, db_path)
-                batch.clear()
+                flows_batch.extend(data)
+            if flows_batch and len(flows_batch) > 2000:
+                save_to_sqlite(flows_batch, profile_batch, db_path)
+                flows_batch.clear()
+                profile_batch.clear()
             if idx % 200 == 0:
                 print(f"Fetched {idx}/{total} stocks...")
-    if batch:
-        save_to_sqlite(batch, db_path)
+    if flows_batch or profile_batch:
+        save_to_sqlite(flows_batch, profile_batch, db_path)
 
 
 def is_trading_day(d: dt.date) -> bool:

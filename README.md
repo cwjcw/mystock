@@ -4,11 +4,13 @@
 
 ## 功能概览
 - 日级资金流与基本信息：`scripts/fund_flow.py`
-  - 主力/超大单/大单/中单/小单（单位：亿元，保留两位小数）
-  - 最新价、涨跌幅（实时行情接口）、总市值（亿元）
+  - 主力/超大单/大单/中单/小单净额与占比（单位：元 / %）
+  - 收盘价、日涨跌幅（来自 AKShare `stock_individual_fund_flow`）
+  - 雪球公司概况（`stock_individual_basic_info_xq`）入库至独立表
   - 支持自定义日期或区间；可保存到 SQLite（中文列名）
-- 分钟级实时资金流：`scripts/realtime_fund_flow.py`
-  - 拉取最新一分钟或全量；可入库 `fund_flow_minute`（中文列名）
+- 实时资金流排名：`scripts/realtime_fund_flow.py`
+  - 调用 AKShare `stock_individual_fund_flow_rank` 按窗口（今日/3日/5日/10日）拉取榜单
+  - 可关注指定股票或输出榜单前 N 名，支持入库 `fund_flow_rank`
 - RSS（脚本）：`scripts/rss_fund_flow.py`
   - 交易时段每 10 分钟生成/更新 RSS 文件（含最新价/涨跌幅/总市值/五类资金，单位亿元）
 - 全市场日终入库：`scripts/daily_bulk_flow.py`
@@ -37,14 +39,14 @@ python scripts/fund_flow.py 600519 --start 2025-09-01 --end 2025-09-12 --all-day
 python scripts/fund_flow.py 600519 sz000001 --date 2025-09-12 --json
 ```
 
-## 分钟级脚本
-- 单次（最新一分钟）：
+## 实时榜单脚本
+- 单次（关注个股）：
 ```
-python scripts/realtime_fund_flow.py --once 000981.SZ 300661.SZ
+python scripts/realtime_fund_flow.py --once 山子高科=000981.SZ 圣邦股份=300661.SZ
 ```
-- 持续轮询并入库：
+- 持续轮询榜单 Top20 并入库（默认使用系统代理，可用 `--proxy none` 禁用）：
 ```
-python scripts/realtime_fund_flow.py --interval 5 --db data/flows.db 000981.SZ 300661.SZ
+python scripts/realtime_fund_flow.py --interval 60 --db data/flows.db
 ```
 
 ## RSS（脚本生成文件）

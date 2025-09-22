@@ -1,263 +1,373 @@
-import asyncio
-import aiohttp
-import time
 import argparse
-import pandas as pd
-from typing import Dict, Optional, Tuple, List
-import sqlite3
-from pathlib import Path
 import datetime as dt
+import os
+import sqlite3
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import akshare as ak
+import pandas as pd
+import requests
+
+try:
+    from akshare.utils import tqdm as ak_tqdm  # type: ignore
+
+    ak_tqdm.get_tqdm = lambda enable=True: (lambda iterable, *args, **kwargs: iterable)
+except Exception:
+    pass
+
+try:
+    from akshare.stock import stock_fund_em  # type: ignore
+
+    stock_fund_em.get_tqdm = lambda enable=True: (lambda iterable, *args, **kwargs: iterable)
+except Exception:
+    pass
 
 
-DEFAULT_HEADERS = {
-    "Referer": "https://quote.eastmoney.com/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-}
+INDICATOR_CHOICES = ["今日", "3日", "5日", "10日"]
 
 
-def symbol_to_secid(symbol: str) -> str:
-    code, exch = symbol.upper().split(".")
-    return ("1." if exch == "SH" else "0.") + code
+def disable_proxies() -> None:
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+        os.environ.pop(key, None)
+    os.environ.setdefault("NO_PROXY", "*")
+    os.environ.setdefault("no_proxy", "*")
 
 
-def parse_kline_line(line: str) -> Dict[str, Optional[float]]:
-    """
-    Eastmoney fflow kline fields mapping:
-    fields2=f51,f52,f53,f54,f55,f56,f57,f58
-    f51=time, f52=main, f53=ultra, f54=large, f55=medium, f56=small
-    """
-    parts = line.split(",")
-
-    def to_float(x: str):
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-    return {
-        "time": parts[0] if len(parts) > 0 else None,
-        "主力": to_float(parts[1]) if len(parts) > 1 else None,
-        "超大单": to_float(parts[2]) if len(parts) > 2 else None,
-        "大单": to_float(parts[3]) if len(parts) > 3 else None,
-        "中单": to_float(parts[4]) if len(parts) > 4 else None,
-        "小单": to_float(parts[5]) if len(parts) > 5 else None,
-    }
+def set_custom_proxy(proxy: str) -> None:
+    if not proxy:
+        return
+    for key in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"]:
+        os.environ[key] = proxy
+    # allow localhost bypass
+    os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+    os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
 
 
-async def fetch_flow_min_kline(
-    session: aiohttp.ClientSession,
-    secid: str,
-    *,
-    klt: int = 1,
-    latest_only: bool = True,
-    timeout: float = 10,
-) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-        "klt": str(klt),
-        "lmt": "1" if latest_only else "0",
-        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
-    }
-    try:
-        async with session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None, None
-            j = await resp.json(content_type=None)
-    except Exception:
-        return None, None
-
-    data = (j or {}).get("data") or {}
-    name = data.get("name")
-    kl = data.get("klines") or []
-    if not kl:
-        return name, None
-
-    rows = [parse_kline_line(line) for line in kl]
-    df = pd.DataFrame(rows)
-    return name, df
+def normalize_code(code: str) -> str:
+    cleaned = code.strip().upper()
+    for suffix in (".SH", ".SZ", ".BJ"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[:-3]
+    if cleaned.startswith("SH") or cleaned.startswith("SZ") or cleaned.startswith("BJ"):
+        cleaned = cleaned[2:]
+    return cleaned.zfill(6)
 
 
-def latest_row(df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
-    if df is None or df.empty:
-        return None
-    return df.iloc[-1]
-
-
-def fmt_scaled(v: Optional[float]) -> str:
-    if v is None:
-        return "-"
-    return f"{(v/100000000):.2f}"
-
-
-def _init_db(conn: sqlite3.Connection):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fund_flow_minute (
-            "代码" TEXT NOT NULL,
-            "交易所" TEXT NOT NULL,
-            "时间" TEXT NOT NULL,
-            "主力" REAL,
-            "超大单" REAL,
-            "大单" REAL,
-            "中单" REAL,
-            "小单" REAL,
-            PRIMARY KEY ("代码", "交易所", "时间")
-        )
-        """
-    )
-
-
-def save_minute_row(conn: sqlite3.Connection, code: str, exchange: str, row: pd.Series):
-    conn.execute(
-        """
-        INSERT INTO fund_flow_minute ("代码","交易所","时间","主力","超大单","大单","中单","小单")
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT("代码","交易所","时间") DO UPDATE SET
-            "主力"=excluded."主力",
-            "超大单"=excluded."超大单",
-            "大单"=excluded."大单",
-            "中单"=excluded."中单",
-            "小单"=excluded."小单"
-        """,
-        (
-            code,
-            exchange,
-            str(row.get("time")),
-            None if row.get("主力") is None else round(float(row.get("主力")) / 1e8, 2),
-            None if row.get("超大单") is None else round(float(row.get("超大单")) / 1e8, 2),
-            None if row.get("大单") is None else round(float(row.get("大单")) / 1e8, 2),
-            None if row.get("中单") is None else round(float(row.get("中单")) / 1e8, 2),
-            None if row.get("小单") is None else round(float(row.get("小单")) / 1e8, 2),
-        ),
-    )
-
-
-async def poll_realtime_flows(
-    name_to_symbol: Dict[str, str],
-    *,
-    interval_sec: int = 5,
-    klt: int = 1,
-    latest_only: bool = True,
-    timeout: float = 10,
-    db_path: Optional[str] = None,
-    use_proxy: bool = False,
-    once: bool = False,
-):
-    connector = aiohttp.TCPConnector(limit=20)
-    timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg, trust_env=use_proxy) as session:
-        conn: Optional[sqlite3.Connection] = None
-        if db_path:
-            p = Path(db_path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(p))
-            _init_db(conn)
-
-        try:
-            while True:
-                start = time.time()
-                name_to_secid = {n: symbol_to_secid(s) for n, s in name_to_symbol.items()}
-                tasks = [
-                    fetch_flow_min_kline(session, secid, klt=klt, latest_only=latest_only, timeout=timeout)
-                    for secid in name_to_secid.values()
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                print(time.strftime("\n== %Y-%m-%d %H:%M:%S =="))
-                for (cname, symbol), result in zip(name_to_secid.items(), results):
-                    if isinstance(result, Exception):
-                        print(f"[{cname}] 请求失败: {result}")
-                        continue
-                    ret_name, df = result
-                    if df is None or df.empty:
-                        print(f"[{cname}] 无数据")
-                        continue
-                    last = latest_row(df)
-                    if last is None:
-                        print(f"[{cname}] 无数据")
-                        continue
-                    print(
-                        f"[{cname} / {ret_name or '-'}] {last['time']} | "
-                        f"主力:{fmt_scaled(last['主力'])} "
-                        f"超大单:{fmt_scaled(last['超大单'])} "
-                        f"大单:{fmt_scaled(last['大单'])} "
-                        f"中单:{fmt_scaled(last['中单'])} "
-                        f"小单:{fmt_scaled(last['小单'])}"
-                    )
-
-                    if conn is not None:
-                        code, exch = symbol.split(".")
-                        save_minute_row(conn, code, exch, last)
-
-                if conn is not None:
-                    conn.commit()
-
-                if once:
-                    break
-
-                elapsed = time.time() - start
-                await asyncio.sleep(max(0, interval_sec - elapsed))
-        finally:
-            if conn is not None:
-                conn.close()
-
-
-def build_default_watchlist() -> Dict[str, str]:
-    return {
-        "山子高科": "000981.SZ",
-        "圣邦股份": "300661.SZ",
-        "中科曙光": "603019.SH",
-        "阿尔特": "300825.SZ",
-        "三博脑科": "301293.SZ",
-    }
-
-
-def parse_name_symbol_pairs(pairs: List[str]) -> Dict[str, str]:
+def parse_targets(pairs: List[str]) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
-    for p in pairs:
-        if "=" in p:
-            name, sym = p.split("=", 1)
-            mapping[name] = sym
+    for item in pairs:
+        if "=" in item:
+            alias, code = item.split("=", 1)
+            mapping[alias.strip()] = normalize_code(code)
         else:
-            # If only symbol provided, use it as name
-            mapping[p] = p
+            code = normalize_code(item)
+            mapping[code] = code
     return mapping
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Realtime A-share fund flow (minute) via Eastmoney")
-    parser.add_argument("pairs", nargs="*", help="Name=Symbol pairs, e.g. 山子高科=000981.SZ 或直接 000981.SZ")
-    parser.add_argument("--interval", type=int, default=5, help="Polling interval seconds")
-    parser.add_argument("--klt", type=int, default=1, choices=[1, 5], help="K-line period: 1 or 5 minutes")
-    parser.add_argument("--all", dest="latest_only", action="store_false", help="Fetch full period instead of latest only")
-    parser.add_argument("--timeout", type=float, default=10, help="HTTP timeout seconds")
-    parser.add_argument("--db", dest="db_path", help="SQLite db file to store minute flows")
-    parser.add_argument("--use-proxy", action="store_true", help="Use system proxy (HTTP[S]_PROXY)")
-    parser.add_argument("--once", action="store_true", help="Run one iteration and exit")
+def _has_proxy_env() -> bool:
+    for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+        if os.environ.get(key):
+            return True
+    return False
+
+
+def fetch_rank(indicator: str, *, _fallback: bool = True) -> pd.DataFrame:
+    try:
+        df = ak.stock_individual_fund_flow_rank(indicator=indicator)
+    except requests.exceptions.ProxyError as exc:
+        if _fallback and _has_proxy_env():
+            print("检测到代理连接失败，自动禁用代理后重试…")
+            disable_proxies()
+            return fetch_rank(indicator, _fallback=False)
+        raise
+    except requests.exceptions.RequestException as exc:
+        if _fallback and _has_proxy_env():
+            print("检测到网络异常，自动禁用代理后重试…")
+            disable_proxies()
+            return fetch_rank(indicator, _fallback=False)
+        raise
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    rename_map: Dict[str, str] = {}
+    for col in df.columns:
+        for prefix in INDICATOR_CHOICES:
+            if col.startswith(prefix) and col not in {"序号", "代码", "名称", "最新价"}:
+                rename_map[col] = col[len(prefix) :]
+                break
+    df.rename(columns=rename_map, inplace=True)
+    df["代码"] = df["代码"].astype(str).apply(normalize_code)
+    for col in df.columns:
+        if col in {"代码", "名称"}:
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["指标"] = indicator
+    return df
+
+
+def filter_for_targets(df: pd.DataFrame, targets: Dict[str, str]) -> pd.DataFrame:
+    if df.empty or not targets:
+        return df
+    codes = list(targets.values())
+    flt = df[df["代码"].isin(codes)].copy()
+    return flt
+
+
+def render_targets(df: pd.DataFrame, targets: Dict[str, str]) -> None:
+    if not targets:
+        return
+    if df.empty:
+        print("暂无排名数据；稍后再试。")
+        return
+    key_cols = [
+        "序号",
+        "代码",
+        "名称",
+        "最新价",
+        "涨跌幅",
+        "主力净流入-净额",
+        "主力净流入-净占比",
+        "超大单净流入-净额",
+        "超大单净流入-净占比",
+        "大单净流入-净额",
+        "大单净流入-净占比",
+        "中单净流入-净额",
+        "中单净流入-净占比",
+        "小单净流入-净额",
+        "小单净流入-净占比",
+    ]
+    display_df = filter_for_targets(df, targets)
+    for alias, code in targets.items():
+        row = display_df[display_df["代码"] == code]
+        if row.empty:
+            print(f"[{alias}] {code}: 未进入榜单")
+            continue
+        r = row.iloc[0]
+        parts = [
+            f"[{alias}] 序号:{int(r['序号'])}",
+            f"名称:{r['名称']}",
+            f"价格:{r['最新价']:.2f}" if pd.notna(r['最新价']) else "价格:-",
+            f"涨跌幅:{r['涨跌幅']:.2f}%" if pd.notna(r['涨跌幅']) else "涨跌幅:-",
+            f"主力净额:{r['主力净流入-净额']/1e8:.2f}亿" if pd.notna(r['主力净流入-净额']) else "主力净额:-",
+            f"主力占比:{r['主力净流入-净占比']:.2f}%" if pd.notna(r['主力净流入-净占比']) else "主力占比:-",
+            f"超大单:{r['超大单净流入-净额']/1e8:.2f}亿" if pd.notna(r['超大单净流入-净额']) else "超大单:-",
+            f"大单:{r['大单净流入-净额']/1e8:.2f}亿" if pd.notna(r['大单净流入-净额']) else "大单:-",
+            f"中单:{r['中单净流入-净额']/1e8:.2f}亿" if pd.notna(r['中单净流入-净额']) else "中单:-",
+            f"小单:{r['小单净流入-净额']/1e8:.2f}亿" if pd.notna(r['小单净流入-净额']) else "小单:-",
+        ]
+        print(" | ".join(parts))
+
+
+def render_top(df: pd.DataFrame, top: int) -> None:
+    if df.empty:
+        print("暂无排名数据；稍后再试。")
+        return
+    subset = df.head(top)
+    cols = [
+        "序号",
+        "代码",
+        "名称",
+        "最新价",
+        "涨跌幅",
+        "主力净流入-净额",
+        "主力净流入-净占比",
+        "超大单净流入-净额",
+        "超大单净流入-净占比",
+        "大单净流入-净额",
+        "大单净流入-净占比",
+        "中单净流入-净额",
+        "中单净流入-净占比",
+        "小单净流入-净额",
+        "小单净流入-净占比",
+    ]
+    header = "\t".join(cols)
+    print(header)
+    for _, row in subset.iterrows():
+        out: List[str] = []
+        for col in cols:
+            val = row.get(col)
+            if pd.isna(val):
+                out.append("-")
+            elif col in {"序号"}:
+                out.append(str(int(val)))
+            elif col in {"代码", "名称"}:
+                out.append(str(val))
+            elif col in {"最新价"}:
+                out.append(f"{float(val):.2f}")
+            elif col in {
+                "涨跌幅",
+                "主力净流入-净占比",
+                "超大单净流入-净占比",
+                "大单净流入-净占比",
+                "中单净流入-净占比",
+                "小单净流入-净占比",
+            }:
+                out.append(f"{float(val):.2f}%")
+            else:
+                out.append(f"{float(val)/1e8:.2f}亿")
+        print("\t".join(out))
+
+
+def _init_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fund_flow_rank (
+            "采集时间" TEXT NOT NULL,
+            "指标" TEXT NOT NULL,
+            "序号" INTEGER,
+            "代码" TEXT NOT NULL,
+            "名称" TEXT,
+            "最新价" REAL,
+            "涨跌幅" REAL,
+            "主力净流入-净额" REAL,
+            "主力净流入-净占比" REAL,
+            "超大单净流入-净额" REAL,
+            "超大单净流入-净占比" REAL,
+            "大单净流入-净额" REAL,
+            "大单净流入-净占比" REAL,
+            "中单净流入-净额" REAL,
+            "中单净流入-净占比" REAL,
+            "小单净流入-净额" REAL,
+            "小单净流入-净占比" REAL,
+            PRIMARY KEY ("采集时间", "指标", "代码")
+        )
+        """
+    )
+
+
+def save_rank_to_db(df: pd.DataFrame, indicator: str, db_path: str) -> None:
+    if df.empty:
+        return
+    p = Path(db_path)
+    if p.parent and not p.parent.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(p))
+    try:
+        _init_db(conn)
+        ts = dt.datetime.now().isoformat(timespec="seconds")
+        rows = []
+        cols = [
+            "序号",
+            "代码",
+            "名称",
+            "最新价",
+            "涨跌幅",
+            "主力净流入-净额",
+            "主力净流入-净占比",
+            "超大单净流入-净额",
+            "超大单净流入-净占比",
+            "大单净流入-净额",
+            "大单净流入-净占比",
+            "中单净流入-净额",
+            "中单净流入-净占比",
+            "小单净流入-净额",
+            "小单净流入-净占比",
+        ]
+        for _, row in df.iterrows():
+            payload = [ts, indicator]
+            for col in cols:
+                payload.append(row.get(col))
+            rows.append(tuple(payload))
+        conn.executemany(
+            """
+            INSERT INTO fund_flow_rank (
+                "采集时间","指标","序号","代码","名称","最新价","涨跌幅",
+                "主力净流入-净额","主力净流入-净占比",
+                "超大单净流入-净额","超大单净流入-净占比",
+                "大单净流入-净额","大单净流入-净占比",
+                "中单净流入-净额","中单净流入-净占比",
+                "小单净流入-净额","小单净流入-净占比"
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT("采集时间","指标","代码") DO UPDATE SET
+                "名称"=excluded."名称",
+                "最新价"=excluded."最新价",
+                "涨跌幅"=excluded."涨跌幅",
+                "主力净流入-净额"=excluded."主力净流入-净额",
+                "主力净流入-净占比"=excluded."主力净流入-净占比",
+                "超大单净流入-净额"=excluded."超大单净流入-净额",
+                "超大单净流入-净占比"=excluded."超大单净流入-净占比",
+                "大单净流入-净额"=excluded."大单净流入-净额",
+                "大单净流入-净占比"=excluded."大单净流入-净占比",
+                "中单净流入-净额"=excluded."中单净流入-净额",
+                "中单净流入-净占比"=excluded."中单净流入-净占比",
+                "小单净流入-净额"=excluded."小单净流入-净额",
+                "小单净流入-净占比"=excluded."小单净流入-净占比"
+            """,
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Realtime fund-flow ranking via AKShare stock_individual_fund_flow_rank"
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="Codes or alias=code pairs (e.g. 中科曙光=603019). If omitted, show top list.",
+    )
+    parser.add_argument(
+        "--indicator",
+        choices=INDICATOR_CHOICES,
+        default="今日",
+        help="Ranking indicator window (default: 今日)",
+    )
+    parser.add_argument("--top", type=int, default=20, help="Rows to display when no targets provided")
+    parser.add_argument("--interval", type=int, default=60, help="Polling interval seconds")
+    parser.add_argument("--once", action="store_true", help="Fetch once and exit")
+    parser.add_argument("--db", dest="db_path", help="Optional SQLite database to store rankings")
+    parser.add_argument(
+        "--proxy",
+        default="system",
+        help="Proxy setting: system (default), none, or http[s]://host:port",
+    )
     args = parser.parse_args()
 
-    watchlist = parse_name_symbol_pairs(args.pairs) if args.pairs else build_default_watchlist()
+    targets = parse_targets(args.targets)
 
-    try:
-        asyncio.run(
-            poll_realtime_flows(
-                watchlist,
-                interval_sec=args.interval,
-                klt=args.klt,
-                latest_only=args.latest_only,
-                timeout=args.timeout,
-                db_path=args.db_path,
-                use_proxy=args.use_proxy,
-                once=args.once,
-            )
-        )
-    except KeyboardInterrupt:
-        print("\n已停止。")
+    proxy_arg = (args.proxy or "system").strip()
+    if proxy_arg.lower() == "none":
+        disable_proxies()
+    elif proxy_arg.lower() == "system":
+        # leave environment untouched
+        pass
+    else:
+        set_custom_proxy(proxy_arg)
+
+    while True:
+        start = time.time()
+        timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n== {timestamp} {args.indicator} ==")
+        try:
+            df = fetch_rank(args.indicator)
+        except Exception as exc:
+            print(f"获取排名数据失败: {exc}")
+            df = pd.DataFrame()
+
+        if targets:
+            render_targets(df, targets)
+        else:
+            render_top(df, args.top)
+
+        if args.db_path:
+            try:
+                save_rank_to_db(df, args.indicator, args.db_path)
+            except Exception as exc:
+                print(f"写入数据库失败: {exc}")
+
+        if args.once:
+            break
+
+        elapsed = time.time() - start
+        sleep_sec = max(0, args.interval - elapsed)
+        time.sleep(sleep_sec)
 
 
 if __name__ == "__main__":
