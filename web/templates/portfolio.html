@@ -11,65 +11,137 @@
   </div>
 </form>
 
-<section class="profit-summary">
-  <div class="profit-card small">
-    <h3>周期已实现盈亏</h3>
-    <p class="profit-value {{ 'profit-positive' if realized_with_initial > 0 else 'profit-negative' if realized_with_initial < 0 else '' }}">{{ '%.2f'|format(realized_with_initial) }} 元</p>
-  </div>
-  <div class="profit-card small">
-    <h3>当前持仓盈亏</h3>
-    <p class="profit-value {{ 'profit-positive' if unrealized_total > 0 else 'profit-negative' if unrealized_total < 0 else '' }}">{{ '%.2f'|format(unrealized_total) }} 元</p>
-    <p>持仓总成本：{{ '%.2f'|format(total_cost_basis) }} 元</p>
-    <p>持仓市值：{{ '%.2f'|format(total_market_value) }} 元</p>
-  </div>
-  <div class="profit-card small">
-    <h3>当日盈亏</h3>
-    <p class="profit-value {{ 'profit-positive' if daily_total > 0 else 'profit-negative' if daily_total < 0 else '' }}">{{ '%.2f'|format(daily_total) }} 元</p>
-    <p class="muted">股票：{{ '%.2f'|format(daily_stock_pnl) }} 元；基金：{{ '%.2f'|format(daily_fund_pnl) }} 元</p>
-  </div>
-  <div class="profit-card small">
-    <h3>总盈亏</h3>
-    <p class="profit-value {{ 'profit-positive' if combined_total > 0 else 'profit-negative' if combined_total < 0 else '' }}">{{ '%.2f'|format(combined_total) }} 元</p>
-    <p class="muted">= 周期已实现（含初始） + 持仓盈亏</p>
-  </div>
+<section class="profit-overview">
+  <ul class="profit-list">
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">周期盈亏</span>
+        <span class="profit-value {{ 'profit-positive' if realized_with_initial > 0 else 'profit-negative' if realized_with_initial < 0 else '' }}">{{ '%.2f'|format(realized_with_initial) }} 元</span>
+      </div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">总盈亏</span>
+        <span class="profit-value {{ 'profit-positive' if combined_total > 0 else 'profit-negative' if combined_total < 0 else '' }}">{{ '%.2f'|format(combined_total) }} 元</span>
+      </div>
+      <div class="profit-extra">= 周期盈亏 + 持仓盈亏</div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">持仓盈亏</span>
+        <span class="profit-value {{ 'profit-positive' if unrealized_total > 0 else 'profit-negative' if unrealized_total < 0 else '' }}">{{ '%.2f'|format(unrealized_total) }} 元</span>
+      </div>
+      <div class="profit-extra">
+        <div>成本：{{ '%.2f'|format(total_cost_basis) }} 元</div>
+        <div>市值：{{ '%.2f'|format(total_market_value) }} 元</div>
+      </div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">当日盈亏</span>
+        <span class="profit-value {{ 'profit-positive' if daily_total > 0 else 'profit-negative' if daily_total < 0 else '' }}">{{ '%.2f'|format(daily_total) }} 元</span>
+      </div>
+      {% set daily_stock_class = 'profit-positive' if daily_stock_pnl > 0 else 'profit-negative' if daily_stock_pnl < 0 else '' %}
+      {% set daily_fund_class = 'profit-positive' if daily_fund_pnl > 0 else 'profit-negative' if daily_fund_pnl < 0 else '' %}
+      <div class="profit-extra">
+        <div>股票：<span class="{{ daily_stock_class }}">{{ '%.2f'|format(daily_stock_pnl) }} 元</span></div>
+        <div>基金：<span class="{{ daily_fund_class }}">{{ '%.2f'|format(daily_fund_pnl) }} 元</span></div>
+      </div>
+    </li>
+  </ul>
 </section>
 
 <section class="positions">
   <h3>当前持仓</h3>
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr>
-       <th>名称</th>
-       <th>数量</th>
-       <th>持仓成本</th>
-        <th>最新价</th>
-        <th>涨跌幅</th>
-        <th>市值</th>
-        <th>持仓盈亏</th>
-        <th>持仓盈亏%</th>
-        <th>当日收益</th>
-      </tr>
-    </thead>
-    <tbody>
+  {% if positions %}
+    <ul class="position-list">
       {% for pos in positions %}
-        <tr>
-          <td>{{ pos.name or pos.symbol }}</td>
-          <td>{{ '%.2f'|format(pos.quantity) }}</td>
-          <td>{{ '%.4f'|format(pos.avg_cost) }}</td>
-          <td>{{ '-' if pos.price is none else '%.4f'|format(pos.price) }}</td>
-          <td class="{{ 'profit-positive' if pos.change_pct is not none and pos.change_pct > 0 else 'profit-negative' if pos.change_pct is not none and pos.change_pct < 0 else '' }}">{{ '-' if pos.change_pct is none else '%.2f'|format(pos.change_pct) }}%</td>
-          <td>{{ '-' if pos.market_value is none else '%.2f'|format(pos.market_value) }}</td>
-          <td class="{{ 'profit-positive' if pos.unrealized is not none and pos.unrealized > 0 else 'profit-negative' if pos.unrealized is not none and pos.unrealized < 0 else '' }}">{{ '-' if pos.unrealized is none else '%.2f'|format(pos.unrealized) }}</td>
-          <td class="{{ 'profit-positive' if pos.unrealized is not none and pos.unrealized > 0 else 'profit-negative' if pos.unrealized is not none and pos.unrealized < 0 else '' }}">{{ '-' if pos.unrealized is none or pos.cost_basis is none or pos.cost_basis == 0 else '%.1f'|format((pos.unrealized / pos.cost_basis) * 100) }}%</td>
-          <td class="{{ 'profit-positive' if pos.daily_change is not none and pos.daily_change > 0 else 'profit-negative' if pos.daily_change is not none and pos.daily_change < 0 else '' }}">{{ '-' if pos.daily_change is none else '%.2f'|format(pos.daily_change) }}</td>
-      </tr>
-      {% else %}
-        <tr>
-          <td colspan="9">暂无持仓。</td>
-        </tr>
+        {% set quantity = '%.2f'|format(pos.quantity) %}
+        {% set avg_cost = '%.4f'|format(pos.avg_cost) %}
+        {% set price_text = '-' if pos.price is none else '%.4f'|format(pos.price) %}
+        {% set change_text = '-' %}
+        {% set change_class = '' %}
+        {% if pos.change_pct is not none %}
+          {% set change_text = '%.2f'|format(pos.change_pct) ~ '%' %}
+          {% if pos.change_pct > 0 %}
+            {% set change_class = 'profit-positive' %}
+          {% elif pos.change_pct < 0 %}
+            {% set change_class = 'profit-negative' %}
+          {% endif %}
+        {% endif %}
+        {% set market_value_text = '-' if pos.market_value is none else '%.2f'|format(pos.market_value) %}
+        {% set unrealized_text = '-' %}
+        {% set unrealized_class = '' %}
+        {% if pos.unrealized is not none %}
+          {% set unrealized_text = '%.2f'|format(pos.unrealized) %}
+          {% if pos.unrealized > 0 %}
+            {% set unrealized_class = 'profit-positive' %}
+          {% elif pos.unrealized < 0 %}
+            {% set unrealized_class = 'profit-negative' %}
+          {% endif %}
+        {% endif %}
+        {% set pct_text = '-' %}
+        {% set pct_class = unrealized_class %}
+        {% if pos.unrealized is not none and pos.cost_basis is not none and pos.cost_basis != 0 %}
+          {% set pct_value = (pos.unrealized / pos.cost_basis) * 100 %}
+          {% set pct_text = '%.1f'|format(pct_value) ~ '%' %}
+          {% if pct_value > 0 %}
+            {% set pct_class = 'profit-positive' %}
+          {% elif pct_value < 0 %}
+            {% set pct_class = 'profit-negative' %}
+          {% else %}
+            {% set pct_class = '' %}
+          {% endif %}
+        {% endif %}
+        {% set daily_text = '-' %}
+        {% set daily_class = '' %}
+        {% if pos.daily_change is not none %}
+          {% set daily_text = '%.2f'|format(pos.daily_change) %}
+          {% if pos.daily_change > 0 %}
+            {% set daily_class = 'profit-positive' %}
+          {% elif pos.daily_change < 0 %}
+            {% set daily_class = 'profit-negative' %}
+          {% endif %}
+        {% endif %}
+        <li class="position-item">
+          <div class="position-name-line">
+            <span class="position-name">{{ pos.name or pos.symbol }}</span>
+            <span class="position-symbol">{{ pos.symbol }}</span>
+          </div>
+          <table class="position-stats">
+            <thead>
+              <tr>
+                <th>数量</th>
+                <th>成本</th>
+                <th>最新价</th>
+                <th>涨跌幅</th>
+                <th>市值</th>
+                <th>持仓盈亏</th>
+                <th>持仓盈亏%</th>
+                <th>当日收益</th>
+                <th>类型</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>{{ quantity }}</td>
+                <td>{{ avg_cost }}</td>
+                <td>{{ price_text }}</td>
+                <td><span class="{{ change_class }}">{{ change_text }}</span></td>
+                <td>{{ market_value_text }}</td>
+                <td><span class="{{ unrealized_class }}">{{ unrealized_text }}</span></td>
+                <td><span class="{{ pct_class }}">{{ pct_text }}</span></td>
+                <td><span class="{{ daily_class }}">{{ daily_text }}</span></td>
+                <td>{{ '股票' if pos.asset_type == 'stock' else '基金' if pos.asset_type == 'fund' else pos.asset_type }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </li>
       {% endfor %}
-    </tbody>
-  </table>
+    </ul>
+  {% else %}
+    <div class="empty">暂无持仓。</div>
+  {% endif %}
 </section>
 
 <section class="initial-profit">

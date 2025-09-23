@@ -4,8 +4,18 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import pathlib
+import sys
 
-from scripts.daily_bulk_flow import BULK_WORKERS_DEFAULT, is_trading_day, run_for_date
+
+if __package__ is None or __package__ == "":
+    # Allow running as a standalone script via "python scripts/fetch_today_fund_flow.py"
+    project_root = pathlib.Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    from scripts.daily_bulk_flow import BULK_WORKERS_DEFAULT, is_trading_day, run_for_date
+else:
+    from .daily_bulk_flow import BULK_WORKERS_DEFAULT, is_trading_day, run_for_date
 
 
 def main() -> None:
@@ -27,13 +37,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+
     if args.date:
         try:
             target_date = dt.datetime.strptime(args.date, "%Y-%m-%d").date()
         except ValueError as exc:
             raise SystemExit(f"Invalid date format: {args.date}") from exc
     else:
-        target_date = dt.date.today()
+        target_date = dt.datetime.now(CHINA_TZ).date()
 
     if not is_trading_day(target_date):
         print(f"{target_date} 非交易日，跳过读取。")

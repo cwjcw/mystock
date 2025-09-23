@@ -17,9 +17,6 @@
   - 每交易日 16:00 抓取全 A 股当日资金流（日级）并入库
 - 多用户 Web：`web/app.py`
   - 注册/登录管理“我的股票”；每用户专属 RSS 链接；支持 token 重置与仅存哈希模式；限速与 .env 配置
-- 资金流 REST API：`web/fund_flow_api.py`
-  - 支持 `/health`、`/api/fund-flow`、`/api/fund-flow/latest` JSON 接口，可通过 Cloudflare Tunnel 对外暴露
-  - 通过 `web/config.json` 或环境变量配置监听端口与多数据库映射，兼容 SQLite 与 MySQL
 
 ## 安装
 ```
@@ -134,22 +131,6 @@ python scripts/daily_bulk_flow.py --dsn "$MYSQL_DSN" --full-history
   conn.close()
   ```
 - 远程编辑器（DataGrip、DBeaver、VSCode SQL 扩展等）可使用同样的连接参数；需要时建议配置只读账号或开启 SSL
-
-## 资金流 API 服务
-- 脚本：`web/fund_flow_api.py`
-  - `/health` 返回默认数据库与可选数据库清单
-  - `/api/fund-flow` 支持参数 `code`、`start`、`end`、`limit`、`exchange`、`db`
-  - `/api/fund-flow/latest` 返回最新一条记录
-  - 查询结果沿用数据库中的中文列名（净额单位“亿元”）
-- 配置：
-  - 默认读取 `web/config.json`（可参考 `web/config.example.json`），也可通过环境变量 `FUND_FLOW_CONFIG` 指向其他配置
-  - 支持为多个数据库配置别名，通过 `?db=` 选择
-- 启动示例：
-  - `./venv/bin/python web/fund_flow_api.py`
-  - 或 `FUND_FLOW_PORT=8800 FLASK_APP=web.fund_flow_api ./venv/bin/flask run --host 0.0.0.0 --port 8800`
-- 对外发布：
-  - 推荐结合 Cloudflare Tunnel（Zero Trust）添加 `fundapi.<your-domain>` 的 Public Hostname，将流量转发到 `http://127.0.0.1:8800`
-  - 可再结合 Access Policy / Service Token 做鉴权与限速
 
 ## 多用户 Web（登录配置 + 每用户 RSS）
 - 启动前请设置 MySQL 连接串：`export APP_MYSQL_DSN="mysql://cwjcw:bj210726@127.0.0.1:3306/mystock?charset=utf8mb4"`

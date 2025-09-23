@@ -381,13 +381,22 @@ def _normalize_trade_symbol(value: str, asset_type: str) -> str | None:
     return parsed[0]['symbol'] if parsed else None
 
 
-def _parse_iso_date(value: str | None) -> dt.date | None:
-    if not value:
+def _parse_iso_date(value: str | dt.date | dt.datetime | None) -> dt.date | None:
+    if value is None or value == '':
         return None
-    try:
-        return dt.date.fromisoformat(value)
-    except ValueError:
-        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):  # already date object
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return dt.date.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
 
 
 def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: Dict[str, str]):
@@ -928,74 +937,133 @@ def generate_rss_response(token: str):
     if not row:
         return ('Not found', 404)
     items = db_query_all('SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s ORDER BY `id`', (row['id'],))
-    mapping = { (r['name'] or r['symbol']): r['symbol'] for r in items }
-    # Fetch latest minute + quote for mapping
+    watch_entries = [(r['name'] or r['symbol'], r['symbol']) for r in items]
+
     async def build_items():
+        if not watch_entries:
+            return []
         connector = aiohttp.TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
-            name_to_secid = { name: symbol_to_secid(sym) for name, sym in mapping.items() }
-            tasks = [fetch_latest_minute(session, secid) for secid in name_to_secid.values()]
-            quotes = [fetch_quote_basic(session, secid) for secid in name_to_secid.values()]
-            results = await asyncio.gather(*tasks)
-            qresults = await asyncio.gather(*quotes)
-        now = dt.datetime.now()
-        out = []
-        for (name, symbol), (nret, rowd), q in zip(name_to_secid.items(), results, qresults):
+            payload = []
+            for name, symbol in watch_entries:
+                try:
+                    secid = symbol_to_secid(symbol)
+                except Exception:
+                    continue
+                payload.append({'name': name, 'symbol': symbol, 'secid': secid})
+            if not payload:
+                return []
+            flow_tasks = [fetch_latest_minute(session, entry['secid']) for entry in payload]
+            quote_tasks = [fetch_quote_basic(session, entry['secid']) for entry in payload]
+            flow_results = await asyncio.gather(*flow_tasks, return_exceptions=True)
+            quote_results = await asyncio.gather(*quote_tasks, return_exceptions=True)
+        now = dt.datetime.now(CHINA_TZ)
+        aggregated: List[dict] = []
+
+        for idx, (entry, flow_res, quote_res) in enumerate(zip(payload, flow_results, quote_results)):
+            if isinstance(flow_res, Exception):
+                continue
+            if not isinstance(flow_res, (tuple, list)) or len(flow_res) != 2:
+                continue
+            if isinstance(quote_res, Exception):
+                quote_res = None
+            nret, rowd = flow_res
             if not rowd:
                 continue
-            price = q.get('price') if q else None
-            chg = q.get('change_pct') if q else None
-            mcap = q.get('market_cap') if q else None
-            mcap_yi = None if mcap is None else round(mcap/1e8, 2)
-            if chg is None or abs(chg) < 1e-8:
-                chg_txt = '-'
-            else:
-                chg_txt = f"{chg:.2f}%"
-            price_txt = '-' if price is None else f"{price:.2f}"
-            mcap_txt = '-' if mcap_yi is None else f"{mcap_yi:.2f}亿"
-            # Apply user-requested label/value mapping for RSS
-            def color_num(val):
-                try:
-                    v = float(val)
-                except Exception:
-                    return f"<span>{val}</span>"
-                color = 'green' if v >= 0 else 'red'
-                return f'<span style="color:{color}">{v}</span>'
-
-            desc = (
-                f"最新价: {price_txt}<br>"
-                f"涨跌幅: {chg_txt}<br>"
-                f"总市值: {mcap_txt}<br>"
-                f"主力: {color_num(rowd['主力'])} 亿元<br>"
-                f"超大单: {color_num(rowd['小单'])} 亿元<br>"
-                f"大单: {color_num(rowd['中单'])} 亿元<br>"
-                f"中单: {color_num(rowd['大单'])} 亿元<br>"
-                f"小单: {color_num(rowd['超大单'])} 亿元"
-            )
-            # Derive per-item metadata consumed by RSS readers
-            base_time = rowd.get('time') or now.strftime('%Y-%m-%d %H:%M:%S')
+            price = quote_res.get('price') if isinstance(quote_res, dict) else None
+            chg = quote_res.get('change_pct') if isinstance(quote_res, dict) else None
+            mcap = quote_res.get('market_cap') if isinstance(quote_res, dict) else None
+            mcap_yi = None if mcap is None else round(mcap / 1e8, 2)
+            base_time = rowd.get('time')
             pub_dt = None
-            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
-                try:
-                    pub_dt = dt.datetime.strptime(base_time, fmt).replace(tzinfo=CHINA_TZ)
-                    break
-                except ValueError:
-                    continue
+            if base_time:
+                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+                    try:
+                        pub_dt = dt.datetime.strptime(base_time, fmt).replace(tzinfo=CHINA_TZ)
+                        break
+                    except ValueError:
+                        continue
             if pub_dt is None:
-                pub_dt = now.astimezone(CHINA_TZ)
-            guid_seed = f"{symbol}|{base_time}|{rowd.get('主力')}|{rowd.get('超大单')}|{rowd.get('大单')}|{rowd.get('中单')}|{rowd.get('小单')}"
-            guid_hash = hashlib.sha1(guid_seed.encode('utf-8')).hexdigest()[:12]
-            exch = symbol.split('.')[-1].lower()
-            quote_link = f"https://quote.eastmoney.com/{exch}{symbol.split('.')[0].lower()}.html"
-            item = {
-                'guid': f"{symbol}_{base_time}_{guid_hash}",
-                'title': f"{name} / {(nret or '')} {base_time}",
-                'description': desc,
-                'pubDate': pub_dt.strftime('%a, %d %b %Y %H:%M:%S %z'),
-                'link': quote_link,
-            }
-            out.append(item)
-        return out
+                pub_dt = now
+                base_time = now.strftime('%Y-%m-%d %H:%M')
+
+            aggregated.append({
+                'order': idx,
+                'name': entry['name'],
+                'symbol': entry['symbol'],
+                'period': nret or '',
+                'time_text': base_time,
+                'price': price,
+                'change_pct': chg,
+                'market_cap_yi': mcap_yi,
+                'flows': {
+                    '主力': rowd.get('主力'),
+                    '超大单': rowd.get('超大单'),
+                    '大单': rowd.get('大单'),
+                    '中单': rowd.get('中单'),
+                    '小单': rowd.get('小单'),
+                },
+                'pub_dt': pub_dt,
+            })
+
+        if not aggregated:
+            return []
+
+        aggregated.sort(key=lambda x: x['order'])
+        latest_pub = max((row['pub_dt'] for row in aggregated), default=now)
+        latest_text = latest_pub.astimezone(CHINA_TZ).strftime('%Y-%m-%d %H:%M')
+
+        def color_num(val, suffix=''):
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                return '-' if val in (None, '') else str(val)
+            color = '#c62828' if v > 0 else '#1e7a1e' if v < 0 else '#333'
+            return f"<span style='color:{color}'>{v:.2f}{suffix}</span>"
+
+        rows_html = ""
+        for row in aggregated:
+            price_txt = '-' if row['price'] is None else f"{row['price']:.2f}"
+            change_html = '-' if row['change_pct'] is None else color_num(row['change_pct'], '%')
+            mcap_txt = '-' if row['market_cap_yi'] is None else f"{row['market_cap_yi']:.2f}亿"
+            rows_html += (
+                "<tr>"
+                f"<td>{row['name']}<br><span style='color:#888;font-size:0.85em'>{row['symbol']}</span></td>"
+                f"<td>{row['period'] or '-'}<br><span style='color:#888;font-size:0.85em'>{row['time_text']}</span></td>"
+                f"<td>{price_txt}</td>"
+                f"<td>{change_html}</td>"
+                f"<td>{mcap_txt}</td>"
+                f"<td>{color_num(row['flows']['主力'], '亿')}</td>"
+                f"<td>{color_num(row['flows']['超大单'], '亿')}</td>"
+                f"<td>{color_num(row['flows']['大单'], '亿')}</td>"
+                f"<td>{color_num(row['flows']['中单'], '亿')}</td>"
+                f"<td>{color_num(row['flows']['小单'], '亿')}</td>"
+                "</tr>"
+            )
+
+        desc = (
+            f"<p>合并覆盖标的：{len(aggregated)} 支</p>"
+            f"<p>最新更新时间：{latest_text}</p>"
+            "<table border='1' cellspacing='0' cellpadding='4' style='border-collapse:collapse;font-size:13px;'>"
+            "<tr><th>标的</th><th>周期/时间</th><th>最新价</th><th>涨跌幅</th><th>总市值</th><th>主力</th><th>超大单</th><th>大单</th><th>中单</th><th>小单</th></tr>"
+            f"{rows_html}" \
+            "</table>"
+        )
+
+        digest_parts = [
+            f"{row['symbol']}|{row['time_text']}|{row['flows'].get('主力')}|{row['flows'].get('超大单')}|{row['flows'].get('大单')}|{row['flows'].get('中单')}|{row['flows'].get('小单')}"
+            for row in aggregated
+        ]
+        guid_hash = hashlib.sha1('||'.join(digest_parts).encode('utf-8')).hexdigest()[:12]
+
+        aggregated_item = {
+            'guid': f"fundflow_{row['id']}_{guid_hash}",
+            'title': f"资金流汇总 {latest_text}",
+            'description': desc,
+            'pubDate': latest_pub.strftime('%a, %d %b %Y %H:%M:%S %z'),
+            'link': f"https://{PUBLIC_DOMAIN}/watchlist",
+        }
+        return [aggregated_item]
 
     items = asyncio.run(build_items())
 
@@ -1007,7 +1075,7 @@ def generate_rss_response(token: str):
             if val is None:
                 return '-'
             try:
-                return f"{round(val)}"
+                return f"{val:.2f}"
             except Exception:
                 return '-'
 
@@ -1029,8 +1097,8 @@ def generate_rss_response(token: str):
             )
 
         portfolio_desc = (
-            f"<p>周期已实现盈亏：{fmt_currency(snapshot['realized_with_initial'])} 元</p>"
-            f"<p>当前持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
+            f"<p>周期盈亏：{fmt_currency(snapshot['realized_with_initial'])} 元</p>"
+            f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
             f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元)</p>"
             "<table border='1' cellspacing='0' cellpadding='4'>"
             "<tr><th>名称</th><th>最新价</th><th>涨跌幅</th><th>市值</th><th>持仓盈亏</th><th>持仓盈亏%</th><th>当日收益</th></tr>"
@@ -1038,11 +1106,12 @@ def generate_rss_response(token: str):
             "</table>"
         )
 
+        timestamp = dt.datetime.now(CHINA_TZ)
         portfolio_item = {
-            'guid': f"portfolio_{row['id']}_{dt.date.today().isoformat()}",
-            'title': f"持仓与盈亏 {dt.date.today().isoformat()}",
+            'guid': f"portfolio_{row['id']}_{timestamp.strftime('%Y%m%d%H%M%S')}",
+            'title': f"持仓与盈亏 {timestamp.strftime('%Y-%m-%d %H:%M')}",
             'description': portfolio_desc,
-            'pubDate': dt.datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z'),
+            'pubDate': timestamp.strftime('%a, %d %b %Y %H:%M:%S %z'),
             'link': f"https://{PUBLIC_DOMAIN}/portfolio",
         }
         items.insert(0, portfolio_item)
