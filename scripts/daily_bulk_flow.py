@@ -15,7 +15,7 @@ import requests
 try:
     from scripts.fund_flow import (
         fetch_fund_flow_dayk,
-        save_to_sqlite,
+        save_to_mysql,
         earliest_fund_flow_date,
         fetch_basic_profile,
         extract_stock_name,
@@ -26,7 +26,7 @@ except ModuleNotFoundError:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
     from fund_flow import (  # type: ignore
         fetch_fund_flow_dayk,
-        save_to_sqlite,
+        save_to_mysql,
         earliest_fund_flow_date,
         fetch_basic_profile,
         extract_stock_name,
@@ -179,7 +179,7 @@ def fetch_all_stock_codes(force_refresh: bool = False) -> List[str]:
 
 
 def run_for_date(
-    db_path: str,
+    dsn: str,
     the_date: Optional[str] = None,
     limit: Optional[int] = None,
     codes_override: Optional[List[str]] = None,
@@ -227,7 +227,7 @@ def run_for_date(
             if batch:
                 flows_collected.extend(batch)
     if flows_collected or profile_map:
-        save_to_sqlite(flows_collected, profile_map, db_path)
+        save_to_mysql(flows_collected, profile_map, dsn)
     elapsed = time.perf_counter() - start_time
     print(
         f"run_for_date({date_label}) processed {len(flows_collected)} records in {elapsed:.2f}s"
@@ -236,7 +236,7 @@ def run_for_date(
 
 
 def run_full_range(
-    db_path: str,
+    dsn: str,
     end_date_str: str,
     limit: Optional[int] = None,
     workers: int = BULK_WORKERS_DEFAULT,
@@ -266,7 +266,7 @@ def run_full_range(
     while current <= end_date:
         if is_trading_day(current):
             run_for_date(
-                db_path,
+                dsn,
                 current.strftime("%Y-%m-%d"),
                 limit=limit,
                 codes_override=codes,
@@ -276,7 +276,7 @@ def run_full_range(
 
 
 def run_full_history(
-    db_path: str,
+    dsn: str,
     limit: Optional[int] = None,
     workers: int = BULK_WORKERS_DEFAULT,
     force_refresh_codes: bool = False,
@@ -311,20 +311,20 @@ def run_full_history(
             if data:
                 flows_batch.extend(data)
             if flows_batch and len(flows_batch) > 2000:
-                save_to_sqlite(flows_batch, profile_batch, db_path)
+                save_to_mysql(flows_batch, profile_batch, dsn)
                 flows_batch.clear()
                 profile_batch.clear()
             if idx % 200 == 0:
                 print(f"Fetched {idx}/{total} stocks...")
     if flows_batch or profile_batch:
-        save_to_sqlite(flows_batch, profile_batch, db_path)
+        save_to_mysql(flows_batch, profile_batch, dsn)
 
 
 def is_trading_day(d: dt.date) -> bool:
     return d.weekday() < 5
 
 
-def scheduler_loop(db_path: str):
+def scheduler_loop(dsn: str):
     """Run daily at 16:00 local time on trading days."""
     while True:
         now = dt.datetime.now()
@@ -342,12 +342,16 @@ def scheduler_loop(db_path: str):
         # When wake up
         today = dt.date.today()
         if is_trading_day(today):
-            run_for_date(db_path, the_date=today.strftime("%Y-%m-%d"))
+            run_for_date(dsn, the_date=today.strftime("%Y-%m-%d"))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Daily bulk fund flow to SQLite at 16:00")
-    parser.add_argument("--db", required=True, help="SQLite db path")
+    parser.add_argument(
+        "--dsn",
+        required=True,
+        help="MySQL DSN (例如 mysql://user:pwd@host:3306/mystock?charset=utf8mb4)",
+    )
     parser.add_argument("--date", help="Run once for date YYYY-MM-DD (no schedule)")
     parser.add_argument("--limit", type=int, help="Limit number of stocks for testing")
     parser.add_argument("--schedule", action="store_true", help="Run scheduler (16:00 every trading day)")
@@ -374,17 +378,17 @@ def main():
 
     workers = max(1, args.workers or BULK_WORKERS_DEFAULT)
     if args.full_history:
-        run_full_history(args.db, limit=args.limit, workers=workers, force_refresh_codes=args.refresh_codes)
+        run_full_history(args.dsn, limit=args.limit, workers=workers, force_refresh_codes=args.refresh_codes)
     elif args.fill_to:
-        run_full_range(args.db, args.fill_to, limit=args.limit, workers=workers, force_refresh_codes=args.refresh_codes)
+        run_full_range(args.dsn, args.fill_to, limit=args.limit, workers=workers, force_refresh_codes=args.refresh_codes)
     elif args.date:
-        run_for_date(args.db, the_date=args.date, limit=args.limit, workers=workers, force_refresh=args.refresh_codes)
+        run_for_date(args.dsn, the_date=args.date, limit=args.limit, workers=workers, force_refresh=args.refresh_codes)
     elif args.schedule:
-        scheduler_loop(args.db)
+        scheduler_loop(args.dsn)
     else:
         # default: run once for today
         run_for_date(
-            args.db,
+            args.dsn,
             the_date=dt.date.today().strftime("%Y-%m-%d"),
             limit=args.limit,
             workers=workers,

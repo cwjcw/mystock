@@ -5,7 +5,6 @@ import time
 import threading
 import math
 from collections import defaultdict, deque
-import sqlite3
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -19,6 +18,7 @@ from flask_login import (
     logout_user,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
+from pymysql.cursors import DictCursor
 
 # Reuse fetchers from scripts for RSS
 try:
@@ -27,6 +27,13 @@ except ModuleNotFoundError:
     import sys
     sys.path.append(str(Path(__file__).resolve().parents[1] / 'scripts'))
     from rss_fund_flow import fetch_latest_minute, fetch_quote_basic, fetch_fund_quote, symbol_to_secid  # type: ignore
+
+try:
+    from scripts.mysql_utils import connect_mysql, MySQLConfigError
+except ModuleNotFoundError:  # pragma: no cover
+    import sys
+    sys.path.append(str(Path(__file__).resolve().parents[1] / 'scripts'))
+    from mysql_utils import connect_mysql, MySQLConfigError  # type: ignore
 
 import asyncio
 import aiohttp
@@ -40,7 +47,6 @@ import xml.etree.ElementTree as ET
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR.parent / 'data'
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / 'app.db'
 PUBLIC_DOMAIN = os.environ.get('PUBLIC_DOMAIN', 'stock.cuixiaoyuan.cn')
 # If RSS_PREFIX == 'username' (default), the URL pattern is /<username>/<token>.rss
 # Otherwise, enforce a fixed prefix string
@@ -66,6 +72,10 @@ RSS_PREFIX = os.environ.get('RSS_PREFIX', RSS_PREFIX)
 RSS_TOKEN_HASH_ONLY = os.environ.get('RSS_TOKEN_HASH_ONLY', 'false').lower() in {'1', 'true', 'yes'}
 APP_PORT = int(os.environ.get('APP_PORT', '18888'))
 DEBUG_FLAG = os.environ.get('DEBUG', 'false').lower() in {'1', 'true', 'yes'}
+
+APP_DB_DSN = os.environ.get('APP_MYSQL_DSN') or os.environ.get('MYSQL_DSN')
+if not APP_DB_DSN:
+    raise RuntimeError('未检测到数据库配置，请设置 APP_MYSQL_DSN 或 MYSQL_DSN')
 
 # Rate limit defaults: 1 request per 60 seconds
 RATE_LIMIT_REQUESTS = int(os.environ.get('RSS_RATE_LIMIT', '1'))  # requests per window
@@ -93,76 +103,98 @@ def _rate_check_and_consume(key: str):
 
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(str(DB_PATH))
-        g.db.row_factory = sqlite3.Row
+        try:
+            g.db = connect_mysql(APP_DB_DSN, cursorclass=DictCursor)
+        except MySQLConfigError as exc:
+            abort(500, description=str(exc))
     return g.db
 
 
 def close_db(e=None):
     db = g.pop('db', None)
     if db is not None:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 def init_db():
-    db = sqlite3.connect(str(DB_PATH))
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            rss_token TEXT UNIQUE,
-            rss_token_hash TEXT,
-            created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS watchlist (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            name TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        CREATE TABLE IF NOT EXISTS trade_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            trade_date TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            action TEXT NOT NULL,
-            quantity REAL NOT NULL,
-            price REAL NOT NULL,
-            fee REAL NOT NULL DEFAULT 0,
-            stamp_tax REAL NOT NULL DEFAULT 0,
-            asset_type TEXT NOT NULL DEFAULT 'stock',
-            note TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        CREATE TABLE IF NOT EXISTS initial_profits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            profit_date TEXT NOT NULL,
-            amount REAL NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """
-    )
-    # Backfill schema if old DB exists without rss_token_hash
+    conn = connect_mysql(APP_DB_DSN, cursorclass=DictCursor)
     try:
-        cols = [r[1] for r in db.execute('PRAGMA table_info(users)').fetchall()]
-        if 'rss_token_hash' not in cols:
-            db.execute('ALTER TABLE users ADD COLUMN rss_token_hash TEXT')
-        trade_cols = [r[1] for r in db.execute('PRAGMA table_info(trade_logs)').fetchall()]
-        if 'asset_type' not in trade_cols:
-            db.execute("ALTER TABLE trade_logs ADD COLUMN asset_type TEXT NOT NULL DEFAULT 'stock'")
-        if 'stamp_tax' not in trade_cols:
-            db.execute("ALTER TABLE trade_logs ADD COLUMN stamp_tax REAL NOT NULL DEFAULT 0")
-    except Exception:
-        pass
-    db.commit()
-    db.close()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `users` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `username` VARCHAR(255) NOT NULL UNIQUE,
+                    `password_hash` VARCHAR(255) NOT NULL,
+                    `rss_token` VARCHAR(255) UNIQUE,
+                    `rss_token_hash` VARCHAR(255),
+                    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `watchlist` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `symbol` VARCHAR(32) NOT NULL,
+                    `name` VARCHAR(255),
+                    CONSTRAINT `fk_watchlist_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `trade_logs` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `trade_date` DATE NOT NULL,
+                    `symbol` VARCHAR(32) NOT NULL,
+                    `action` VARCHAR(32) NOT NULL,
+                    `quantity` DOUBLE NOT NULL,
+                    `price` DOUBLE NOT NULL,
+                    `fee` DOUBLE NOT NULL DEFAULT 0,
+                    `stamp_tax` DOUBLE NOT NULL DEFAULT 0,
+                    `asset_type` VARCHAR(32) NOT NULL DEFAULT 'stock',
+                    `note` TEXT,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT `fk_trade_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `initial_profits` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `profit_date` DATE NOT NULL,
+                    `amount` DOUBLE NOT NULL,
+                    `note` TEXT,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT `fk_initial_profit_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+        # Backfill columns if missing
+        with conn.cursor() as cur:
+            cur.execute("SHOW COLUMNS FROM `users`")
+            user_cols = {row['Field'] for row in cur.fetchall()}
+            if 'rss_token_hash' not in user_cols:
+                cur.execute("ALTER TABLE `users` ADD COLUMN `rss_token_hash` VARCHAR(255)")
+
+            cur.execute("SHOW COLUMNS FROM `trade_logs`")
+            trade_cols = {row['Field'] for row in cur.fetchall()}
+            if 'asset_type' not in trade_cols:
+                cur.execute("ALTER TABLE `trade_logs` ADD COLUMN `asset_type` VARCHAR(32) NOT NULL DEFAULT 'stock'")
+            if 'stamp_tax' not in trade_cols:
+                cur.execute("ALTER TABLE `trade_logs` ADD COLUMN `stamp_tax` DOUBLE NOT NULL DEFAULT 0")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 app = Flask(__name__)
@@ -181,8 +213,10 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    db = get_db()
-    row = db.execute('SELECT id, username, password_hash, rss_token FROM users WHERE id = ?', (user_id,)).fetchone()
+    row = db_query_one(
+        'SELECT `id`, `username`, `password_hash`, `rss_token` FROM `users` WHERE `id` = %s',
+        (user_id,),
+    )
     if row:
         return User(row['id'], row['username'], row['password_hash'], row['rss_token'])
     return None
@@ -190,6 +224,35 @@ def load_user(user_id):
 
 # Flask 3.0 移除了 before_first_request，直接在模块加载时初始化数据库
 init_db()
+
+
+def db_query_one(sql: str, params: Optional[tuple] = None) -> Optional[Dict]:
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(sql, params or ())
+        return cur.fetchone()
+
+
+def db_query_all(sql: str, params: Optional[tuple] = None) -> List[Dict]:
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(sql, params or ())
+        return cur.fetchall()
+
+
+def db_execute(sql: str, params: Optional[tuple] = None) -> int:
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(sql, params or ())
+        return cur.rowcount
+
+
+def db_executemany(sql: str, params_seq: List[tuple]) -> None:
+    if not params_seq:
+        return
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.executemany(sql, params_seq)
 
 
 @app.teardown_appcontext
@@ -212,28 +275,29 @@ def register():
         if not username or not password:
             flash('请输入用户名和密码', 'error')
             return render_template('register.html')
-        db = get_db()
-        if db.execute('SELECT 1 FROM users WHERE username = ?', (username,)).fetchone():
+        existing = db_query_one('SELECT 1 FROM `users` WHERE `username` = %s', (username,))
+        if existing:
             flash('用户名已存在', 'error')
             return render_template('register.html')
         token = secrets.token_urlsafe(24)
         token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
-        db.execute(
-            'INSERT INTO users (username, password_hash, rss_token, rss_token_hash, created_at) VALUES (?, ?, ?, ?, ?)',
+        db_execute(
+            'INSERT INTO `users` (`username`, `password_hash`, `rss_token`, `rss_token_hash`) VALUES (%s, %s, %s, %s)',
             (
                 username,
                 generate_password_hash(password),
                 None if RSS_TOKEN_HASH_ONLY else token,
                 token_hash if RSS_TOKEN_HASH_ONLY else None,
-                dt.datetime.now().isoformat(timespec='seconds'),
             ),
         )
-        db.commit()
         if RSS_TOKEN_HASH_ONLY:
             flash(f'注册成功，请妥善保存你的RSS Token（只显示一次）：{token}', 'success')
             flash('下次若遗失可在“我的股票”页面重置 Token。', 'success')
             # 直接登录并跳转到watchlist，方便复制
-            row = db.execute('SELECT id, username, password_hash, rss_token, rss_token_hash FROM users WHERE username = ?', (username,)).fetchone()
+            row = db_query_one(
+                'SELECT `id`, `username`, `password_hash`, `rss_token`, `rss_token_hash` FROM `users` WHERE `username` = %s',
+                (username,),
+            )
             user = User(row['id'], row['username'], row['password_hash'], row['rss_token'])
             login_user(user)
             return redirect(url_for('watchlist_view'))
@@ -248,8 +312,10 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
-        db = get_db()
-        row = db.execute('SELECT id, username, password_hash, rss_token FROM users WHERE username = ?', (username,)).fetchone()
+        row = db_query_one(
+            'SELECT `id`, `username`, `password_hash`, `rss_token` FROM `users` WHERE `username` = %s',
+            (username,),
+        )
         if not row or not check_password_hash(row['password_hash'], password):
             flash('用户名或密码错误', 'error')
             return render_template('login.html')
@@ -420,11 +486,11 @@ def _fetch_quotes_for_symbols(entries: List[tuple[str, str]]) -> Dict[str, dict]
 
 
 def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date) -> dict:
-    db = get_db()
-    rows = db.execute(
-        'SELECT trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type FROM trade_logs WHERE user_id = ? ORDER BY trade_date ASC, id ASC',
+    rows = db_query_all(
+        'SELECT `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type` '
+        'FROM `trade_logs` WHERE `user_id` = %s ORDER BY `trade_date` ASC, `id` ASC',
         (user_id,),
-    ).fetchall()
+    )
 
     symbol_asset: Dict[str, str] = {}
     for r in rows:
@@ -500,10 +566,11 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         key=lambda x: x['symbol'],
     )
 
-    profits = db.execute(
-        'SELECT id, profit_date, amount, note FROM initial_profits WHERE user_id = ? ORDER BY profit_date DESC, id DESC',
+    profits = db_query_all(
+        'SELECT `id`, `profit_date`, `amount`, `note` FROM `initial_profits` '
+        'WHERE `user_id` = %s ORDER BY `profit_date` DESC, `id` DESC',
         (user_id,),
-    ).fetchall()
+    )
     initial_period_total = 0.0
     for row in profits:
         pdate = _parse_iso_date(row['profit_date'])
@@ -535,18 +602,22 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
 @app.route('/watchlist', methods=['GET', 'POST'])
 @login_required
 def watchlist_view():
-    db = get_db()
     if request.method == 'POST':
         raw = request.form.get('symbols', '')
         items = _parse_symbols(raw)
-        db.execute('DELETE FROM watchlist WHERE user_id = ?', (current_user.id,))
-        for it in items:
-            db.execute('INSERT INTO watchlist (user_id, symbol, name) VALUES (?, ?, ?)', (current_user.id, it['symbol'], it['name']))
-        db.commit()
+        db_execute('DELETE FROM `watchlist` WHERE `user_id` = %s', (current_user.id,))
+        payload = [(current_user.id, it['symbol'], it['name']) for it in items]
+        db_executemany(
+            'INSERT INTO `watchlist` (`user_id`, `symbol`, `name`) VALUES (%s, %s, %s)',
+            payload,
+        )
         flash('已保存股票列表', 'success')
         return redirect(url_for('watchlist_view'))
 
-    rows = db.execute('SELECT symbol, name FROM watchlist WHERE user_id = ? ORDER BY id', (current_user.id,)).fetchall()
+    rows = db_query_all(
+        'SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s ORDER BY `id`',
+        (current_user.id,),
+    )
     text = '\n'.join([f"{r['name']}={r['symbol']}" if r['name'] != r['symbol'] else r['symbol'] for r in rows])
     # Resolve prefix for display
     resolved_prefix = current_user.username if RSS_PREFIX == 'username' else RSS_PREFIX
@@ -563,7 +634,6 @@ def watchlist_view():
 @app.route('/trades', methods=['GET', 'POST'])
 @login_required
 def trades_view():
-    db = get_db()
     if request.method == 'POST':
         trade_date = request.form.get('trade_date', '').strip()
         symbol_input_raw = request.form.get('symbol', '')
@@ -611,11 +681,11 @@ def trades_view():
             flash('印花税需为数字。', 'error')
             return redirect(url_for('trades_view'))
 
-        db.execute(
-            'INSERT INTO trade_logs (user_id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        db_execute(
+            'INSERT INTO `trade_logs` (`user_id`, `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
             (current_user.id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, None),
         )
-        db.commit()
         flash('已记录交易。', 'success')
         return redirect(url_for('trades_view'))
 
@@ -627,16 +697,18 @@ def trades_view():
     if page < 1:
         page = 1
     per_page = 50
-    total = db.execute('SELECT COUNT(1) FROM trade_logs WHERE user_id = ?', (current_user.id,)).fetchone()[0]
+    total_row = db_query_one('SELECT COUNT(1) AS cnt FROM `trade_logs` WHERE `user_id` = %s', (current_user.id,))
+    total = total_row['cnt'] if total_row else 0
     total = total or 0
     max_page = max(1, math.ceil(total / per_page)) if total else 1
     if page > max_page:
         page = max_page
     offset = (page - 1) * per_page
-    trades = db.execute(
-        'SELECT id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, note, created_at FROM trade_logs WHERE user_id = ? ORDER BY trade_date DESC, id DESC LIMIT ? OFFSET ?',
+    trades = db_query_all(
+        'SELECT `id`, `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`, `created_at` '
+        'FROM `trade_logs` WHERE `user_id` = %s ORDER BY `trade_date` DESC, `id` DESC LIMIT %s OFFSET %s',
         (current_user.id, per_page, offset),
-    ).fetchall()
+    )
 
     name_map: Dict[str, str] = {}
     if trades:
@@ -663,11 +735,11 @@ def trades_view():
 
 
 def _get_trade_or_404(trade_id: int):
-    db = get_db()
-    trade = db.execute(
-        'SELECT id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, note FROM trade_logs WHERE id = ? AND user_id = ?',
+    trade = db_query_one(
+        'SELECT `id`, `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note` '
+        'FROM `trade_logs` WHERE `id` = %s AND `user_id` = %s',
         (trade_id, current_user.id),
-    ).fetchone()
+    )
     if not trade:
         abort(404)
     return trade
@@ -677,7 +749,6 @@ def _get_trade_or_404(trade_id: int):
 @login_required
 def edit_trade(trade_id: int):
     trade = _get_trade_or_404(trade_id)
-    db = get_db()
     if request.method == 'POST':
         trade_date = request.form.get('trade_date', '').strip()
         symbol_input_raw = request.form.get('symbol', '')
@@ -724,11 +795,11 @@ def edit_trade(trade_id: int):
             flash('印花税需为数字。', 'error')
             return redirect(url_for('edit_trade', trade_id=trade_id))
 
-        db.execute(
-            'UPDATE trade_logs SET trade_date=?, symbol=?, action=?, quantity=?, price=?, fee=?, stamp_tax=?, asset_type=?, note=NULL WHERE id=? AND user_id=?',
+        db_execute(
+            'UPDATE `trade_logs` SET `trade_date`=%s, `symbol`=%s, `action`=%s, `quantity`=%s, `price`=%s, `fee`=%s, '
+            '`stamp_tax`=%s, `asset_type`=%s, `note`=NULL WHERE `id`=%s AND `user_id`=%s',
             (trade_date, normalized_symbol, action, quantity, price, fee, stamp_tax, asset_type, trade_id, current_user.id),
         )
-        db.commit()
         flash('已更新交易。', 'success')
         return redirect(url_for('trades_view'))
 
@@ -738,10 +809,8 @@ def edit_trade(trade_id: int):
 @app.route('/trades/<int:trade_id>/delete', methods=['POST'])
 @login_required
 def delete_trade(trade_id: int):
-    db = get_db()
-    cur = db.execute('DELETE FROM trade_logs WHERE id = ? AND user_id = ?', (trade_id, current_user.id))
-    db.commit()
-    if cur.rowcount:
+    rowcount = db_execute('DELETE FROM `trade_logs` WHERE `id` = %s AND `user_id` = %s', (trade_id, current_user.id))
+    if rowcount:
         flash('已删除交易。', 'success')
     else:
         flash('未找到对应交易。', 'error')
@@ -788,19 +857,16 @@ def portfolio_view():
 @login_required
 def add_initial_profit():
     amount_raw = request.form.get('amount', '').strip()
-    note = request.form.get('note', '').strip() or None
     try:
         amount = float(amount_raw)
     except ValueError:
         flash('初始盈利需为数字。', 'error')
         return redirect(url_for('portfolio_view'))
     profit_date = dt.date.today().isoformat()
-    db = get_db()
-    db.execute(
-        'INSERT INTO initial_profits (user_id, profit_date, amount, note) VALUES (?, ?, ?, ?)',
-        (current_user.id, profit_date, amount, note),
+    db_execute(
+        'INSERT INTO `initial_profits` (`user_id`, `profit_date`, `amount`, `note`) VALUES (%s, %s, %s, %s)',
+        (current_user.id, profit_date, amount, None),
     )
-    db.commit()
     flash('已记录初始盈利。', 'success')
     return redirect(url_for('portfolio_view'))
 
@@ -808,10 +874,8 @@ def add_initial_profit():
 @app.route('/initial_profits/<int:profit_id>/delete', methods=['POST'])
 @login_required
 def delete_initial_profit(profit_id: int):
-    db = get_db()
-    cur = db.execute('DELETE FROM initial_profits WHERE id = ? AND user_id = ?', (profit_id, current_user.id))
-    db.commit()
-    if cur.rowcount:
+    rowcount = db_execute('DELETE FROM `initial_profits` WHERE `id` = %s AND `user_id` = %s', (profit_id, current_user.id))
+    if rowcount:
         flash('已删除初始盈利记录。', 'success')
     else:
         flash('未找到对应记录。', 'error')
@@ -821,31 +885,28 @@ def delete_initial_profit(profit_id: int):
 @app.route('/reset_token', methods=['POST'])
 @login_required
 def reset_token():
-    db = get_db()
     token = secrets.token_urlsafe(24)
     token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
     # 构造完整订阅链接
     resolved_prefix = current_user.username if RSS_PREFIX == 'username' else RSS_PREFIX
     rss_url = f"https://{PUBLIC_DOMAIN}/{resolved_prefix}/{token}.rss" if RSS_PREFIX else f"https://{PUBLIC_DOMAIN}/u/{token}.rss"
     if RSS_TOKEN_HASH_ONLY:
-        db.execute('UPDATE users SET rss_token=NULL, rss_token_hash=? WHERE id=?', (token_hash, current_user.id))
+        db_execute('UPDATE `users` SET `rss_token`=NULL, `rss_token_hash`=%s WHERE `id`=%s', (token_hash, current_user.id))
         flash(f'新的RSS Token（只显示一次）：{token}', 'success')
         flash(f'你的专属RSS订阅链接（只显示一次）：{rss_url}', 'success')
     else:
-        db.execute('UPDATE users SET rss_token=?, rss_token_hash=NULL WHERE id=?', (token, current_user.id))
+        db_execute('UPDATE `users` SET `rss_token`=%s, `rss_token_hash`=NULL WHERE `id`=%s', (token, current_user.id))
         flash('已重置RSS Token。', 'success')
-    db.commit()
     return redirect(url_for('watchlist_view'))
 
 
-def _find_user_by_token(db, token: str):
+def _find_user_by_token(token: str):
     # match by plain token or sha256(token)
-    row = db.execute('SELECT id, username FROM users WHERE rss_token = ?', (token,)).fetchone()
+    row = db_query_one('SELECT `id`, `username` FROM `users` WHERE `rss_token` = %s', (token,))
     if row:
         return row
     th = hashlib.sha256(token.encode('utf-8')).hexdigest()
-    row = db.execute('SELECT id, username FROM users WHERE rss_token_hash = ?', (th,)).fetchone()
-    return row
+    return db_query_one('SELECT `id`, `username` FROM `users` WHERE `rss_token_hash` = %s', (th,))
 
 
 def generate_rss_response(token: str):
@@ -863,11 +924,10 @@ def generate_rss_response(token: str):
         resp.headers['Retry-After'] = str(retry)
         return resp
 
-    db = get_db()
-    row = _find_user_by_token(db, token)
+    row = _find_user_by_token(token)
     if not row:
         return ('Not found', 404)
-    items = db.execute('SELECT symbol, name FROM watchlist WHERE user_id = ? ORDER BY id', (row['id'],)).fetchall()
+    items = db_query_all('SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s ORDER BY `id`', (row['id'],))
     mapping = { (r['name'] or r['symbol']): r['symbol'] for r in items }
     # Fetch latest minute + quote for mapping
     async def build_items():
@@ -1016,8 +1076,7 @@ def user_rss(token: str):
 @app.route('/<prefix>/<token>.rss')
 def prefixed_rss(prefix: str, token: str):
     # Enforce prefix policy
-    db = get_db()
-    row = _find_user_by_token(db, token)
+    row = _find_user_by_token(token)
     if not row:
         return ('Not found', 404)
     if RSS_PREFIX == 'username':

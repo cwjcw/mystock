@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-from pathlib import Path
+import os
 
 from scripts.daily_bulk_flow import BULK_WORKERS_DEFAULT, is_trading_day, run_for_date
 
@@ -15,9 +15,9 @@ def main() -> None:
         help="Date to fetch in YYYY-MM-DD (default: today)",
     )
     parser.add_argument(
-        "--db",
-        default=str(Path(__file__).resolve().parents[1] / "data" / "stocks.db"),
-        help="SQLite DB path (default: data/stocks.db)",
+        "--dsn",
+        default=os.environ.get("MYSQL_DSN"),
+        help="MySQL DSN (默认读取环境变量 MYSQL_DSN)",
     )
     parser.add_argument(
         "--workers",
@@ -39,8 +39,11 @@ def main() -> None:
         print(f"{target_date} 非交易日，跳过读取。")
         return
 
+    if not args.dsn:
+        raise SystemExit("缺少 MySQL DSN，请通过 --dsn 或环境变量 MYSQL_DSN 提供")
+
     run_for_date(
-        db_path=args.db,
+        args.dsn,
         the_date=target_date.strftime("%Y-%m-%d"),
         workers=args.workers or BULK_WORKERS_DEFAULT,
     )

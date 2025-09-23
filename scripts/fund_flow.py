@@ -2,12 +2,20 @@ import argparse
 import datetime as dt
 import json
 import os
-import sqlite3
-from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import akshare as ak
 import requests
+from pymysql.cursors import Cursor
+
+try:
+    from .mysql_utils import connect_mysql
+except ImportError:  # pragma: no cover
+    import sys
+    import pathlib
+
+    sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+    from mysql_utils import connect_mysql  # type: ignore
 
 
 T = TypeVar("T")
@@ -160,85 +168,43 @@ def earliest_fund_flow_date(code: str) -> Optional[str]:
     return min(r["date"] for r in rows)
 
 
-def _init_db(conn: sqlite3.Connection):
-    # 资金流表 + 基本信息表（雪球字段）
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS stock_basic_info_xq (
-            "代码" TEXT NOT NULL,
-            "交易所" TEXT NOT NULL,
-            "字段" TEXT NOT NULL,
-            "值" TEXT,
-            "更新时间" TEXT,
-            PRIMARY KEY ("代码", "交易所", "字段")
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS fund_flow_daily (
-            "代码" TEXT NOT NULL,
-            "交易所" TEXT NOT NULL,
-            "日期" TEXT NOT NULL,
-            "收盘价" REAL,
-            "涨跌幅" REAL,
-            "主力净流入-净额" REAL,
-            "主力净流入-净占比" REAL,
-            "超大单净流入-净额" REAL,
-            "超大单净流入-净占比" REAL,
-            "大单净流入-净额" REAL,
-            "大单净流入-净占比" REAL,
-            "中单净流入-净额" REAL,
-            "中单净流入-净占比" REAL,
-            "小单净流入-净额" REAL,
-            "小单净流入-净占比" REAL,
-            "名称" TEXT,
-            PRIMARY KEY ("代码", "交易所", "日期")
-        )
-        """
-    )
+FUND_FLOW_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `fund_flow_daily` (
+    `代码` VARCHAR(6) NOT NULL,
+    `交易所` VARCHAR(4) NOT NULL,
+    `日期` DATE NOT NULL,
+    `收盘价` DOUBLE NULL,
+    `涨跌幅` DOUBLE NULL,
+    `主力净流入-净额` DOUBLE NULL,
+    `主力净流入-净占比` DOUBLE NULL,
+    `超大单净流入-净额` DOUBLE NULL,
+    `超大单净流入-净占比` DOUBLE NULL,
+    `大单净流入-净额` DOUBLE NULL,
+    `大单净流入-净占比` DOUBLE NULL,
+    `中单净流入-净额` DOUBLE NULL,
+    `中单净流入-净占比` DOUBLE NULL,
+    `小单净流入-净额` DOUBLE NULL,
+    `小单净流入-净占比` DOUBLE NULL,
+    `名称` VARCHAR(255) NULL,
+    PRIMARY KEY (`代码`, `交易所`, `日期`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"""
 
-    cols = {row[1] for row in conn.execute('PRAGMA table_info("fund_flow_daily")')}
-    rename_map = {
-        "主力": "主力净流入-净额",
-        "超大单": "超大单净流入-净额",
-        "大单": "大单净流入-净额",
-        "中单": "中单净流入-净额",
-        "小单": "小单净流入-净额",
-    }
-    for old, new in rename_map.items():
-        if old in cols and new not in cols:
-            conn.execute(f'ALTER TABLE fund_flow_daily RENAME COLUMN "{old}" TO "{new}"')
+STOCK_BASIC_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `stock_basic_info_xq` (
+    `代码` VARCHAR(6) NOT NULL,
+    `交易所` VARCHAR(4) NOT NULL,
+    `字段` VARCHAR(255) NOT NULL,
+    `值` TEXT NULL,
+    `更新时间` DATETIME NULL,
+    PRIMARY KEY (`代码`, `交易所`, `字段`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"""
 
-    def _drop_column(column: str) -> None:
-        try:
-            conn.execute(f'ALTER TABLE fund_flow_daily DROP COLUMN "{column}"')
-        except sqlite3.OperationalError:
-            pass
 
-    # Remove obsolete columns if they still exist
-    _drop_column("总市值")
-    _drop_column("最新价")
-
-    cols = {row[1] for row in conn.execute('PRAGMA table_info("fund_flow_daily")')}
-    required_cols = {
-        "收盘价": "REAL",
-        "涨跌幅": "REAL",
-        "主力净流入-净额": "REAL",
-        "主力净流入-净占比": "REAL",
-        "超大单净流入-净额": "REAL",
-        "超大单净流入-净占比": "REAL",
-        "大单净流入-净额": "REAL",
-        "大单净流入-净占比": "REAL",
-        "中单净流入-净额": "REAL",
-        "中单净流入-净占比": "REAL",
-        "小单净流入-净额": "REAL",
-        "小单净流入-净占比": "REAL",
-        "名称": "TEXT",
-    }
-    for col, col_type in required_cols.items():
-        if col not in cols:
-            conn.execute(f'ALTER TABLE fund_flow_daily ADD COLUMN "{col}" {col_type}')
+def ensure_schema(cursor: Cursor) -> None:
+    cursor.execute(FUND_FLOW_TABLE_SQL)
+    cursor.execute(STOCK_BASIC_TABLE_SQL)
 
 def fetch_basic_profile(
     code: str,
@@ -278,22 +244,21 @@ def extract_stock_name(profile: Dict[str, str]) -> Optional[str]:
     return None
 
 
-def save_to_sqlite(
+def save_to_mysql(
     flows: Iterable[Dict],
     profiles: Dict[Tuple[str, str], Dict[str, str]],
-    db_path: str,
+    dsn: str,
 ):
     flow_list = list(flows)
     if not flow_list and not profiles:
         return
 
-    p = Path(db_path)
-    if p.parent and not p.parent.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(str(p))
+    conn = connect_mysql(dsn, autocommit=False)
     try:
-        _init_db(conn)
+        with conn.cursor() as cursor:
+            ensure_schema(cursor)
+        conn.commit()
+
         now_iso = dt.datetime.now().isoformat(timespec="seconds")
 
         if profiles:
@@ -302,16 +267,13 @@ def save_to_sqlite(
                 for field, value in data.items():
                     basic_rows.append((code, exchange, field, value, now_iso))
             if basic_rows:
-                conn.executemany(
-                    """
-                    INSERT INTO stock_basic_info_xq ("代码","交易所","字段","值","更新时间")
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT("代码","交易所","字段") DO UPDATE SET
-                        "值"=excluded."值",
-                        "更新时间"=excluded."更新时间"
-                    """,
-                    basic_rows,
+                sql_basic = (
+                    "INSERT INTO `stock_basic_info_xq` (`代码`,`交易所`,`字段`,`值`,`更新时间`) "
+                    "VALUES (%s,%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE `值`=VALUES(`值`), `更新时间`=VALUES(`更新时间`)"
                 )
+                with conn.cursor() as cursor:
+                    cursor.executemany(sql_basic, basic_rows)
 
         def to_float(val: Optional[float]) -> Optional[float]:
             if val is None:
@@ -359,34 +321,32 @@ def save_to_sqlite(
             )
 
         if flow_rows:
-            conn.executemany(
-                """
-                INSERT INTO fund_flow_daily (
-                    "代码","交易所","日期","收盘价","涨跌幅",
-                    "主力净流入-净额","主力净流入-净占比",
-                    "超大单净流入-净额","超大单净流入-净占比",
-                    "大单净流入-净额","大单净流入-净占比",
-                    "中单净流入-净额","中单净流入-净占比",
-                    "小单净流入-净额","小单净流入-净占比",
-                    "名称"
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT("代码","交易所","日期") DO UPDATE SET
-                    "收盘价"=excluded."收盘价",
-                    "涨跌幅"=excluded."涨跌幅",
-                    "主力净流入-净额"=excluded."主力净流入-净额",
-                    "主力净流入-净占比"=excluded."主力净流入-净占比",
-                    "超大单净流入-净额"=excluded."超大单净流入-净额",
-                    "超大单净流入-净占比"=excluded."超大单净流入-净占比",
-                    "大单净流入-净额"=excluded."大单净流入-净额",
-                    "大单净流入-净占比"=excluded."大单净流入-净占比",
-                    "中单净流入-净额"=excluded."中单净流入-净额",
-                    "中单净流入-净占比"=excluded."中单净流入-净占比",
-                    "小单净流入-净额"=excluded."小单净流入-净额",
-                    "小单净流入-净占比"=excluded."小单净流入-净占比",
-                    "名称"=excluded."名称"
-                """,
-                flow_rows,
+            sql_flow = (
+                "INSERT INTO `fund_flow_daily` ("
+                "`代码`,`交易所`,`日期`,`收盘价`,`涨跌幅`,"
+                "`主力净流入-净额`,`主力净流入-净占比`,"
+                "`超大单净流入-净额`,`超大单净流入-净占比`,"
+                "`大单净流入-净额`,`大单净流入-净占比`,"
+                "`中单净流入-净额`,`中单净流入-净占比`,"
+                "`小单净流入-净额`,`小单净流入-净占比`,`名称`"
+                ") VALUES (" + ",".join(["%s"] * 16) + ") "
+                "ON DUPLICATE KEY UPDATE "
+                "`收盘价`=VALUES(`收盘价`),"
+                "`涨跌幅`=VALUES(`涨跌幅`),"
+                "`主力净流入-净额`=VALUES(`主力净流入-净额`),"
+                "`主力净流入-净占比`=VALUES(`主力净流入-净占比`),"
+                "`超大单净流入-净额`=VALUES(`超大单净流入-净额`),"
+                "`超大单净流入-净占比`=VALUES(`超大单净流入-净占比`),"
+                "`大单净流入-净额`=VALUES(`大单净流入-净额`),"
+                "`大单净流入-净占比`=VALUES(`大单净流入-净占比`),"
+                "`中单净流入-净额`=VALUES(`中单净流入-净额`),"
+                "`中单净流入-净占比`=VALUES(`中单净流入-净占比`),"
+                "`小单净流入-净额`=VALUES(`小单净流入-净额`),"
+                "`小单净流入-净占比`=VALUES(`小单净流入-净占比`),"
+                "`名称`=VALUES(`名称`)"
             )
+            with conn.cursor() as cursor:
+                cursor.executemany(sql_flow, flow_rows)
 
         conn.commit()
     finally:
@@ -401,7 +361,12 @@ def main():
     parser.add_argument("--end", dest="end", help="End date YYYY-MM-DD")
     parser.add_argument("--all-days", action="store_true", help="Output all days in range instead of only the latest")
     parser.add_argument("--json", action="store_true", help="Output JSON lines instead of table")
-    parser.add_argument("--db", dest="db_path", help="SQLite file path to save results")
+    parser.add_argument(
+        "--dsn",
+        dest="dsn",
+        default=os.environ.get("MYSQL_DSN"),
+        help="MySQL DSN，例如 mysql://user:pwd@host:3306/mystock?charset=utf8mb4",
+    )
     parser.add_argument("--xq-token", dest="xq_token", help="Override Xueqiu token for basic info")
     parser.add_argument("--timeout", type=float, default=None, help="Request timeout for Xueqiu basic info")
     parser.add_argument("--earliest", action="store_true", help="Only print earliest available date for each code")
@@ -455,8 +420,8 @@ def main():
         for f in flows:
             flows_for_output.append({**f, "name": name})
 
-    if args.db_path:
-        save_to_sqlite(flows_for_output, profile_map, args.db_path)
+    if args.dsn:
+        save_to_mysql(flows_for_output, profile_map, args.dsn)
 
     def _to_float(value: Optional[float]) -> Optional[float]:
         try:

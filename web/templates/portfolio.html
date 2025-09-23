@@ -34,48 +34,6 @@
   </div>
 </section>
 
-<section class="initial-profit">
-  <h3>初始盈利记录</h3>
-  <form method="post" action="{{ url_for('add_initial_profit') }}" class="initial-form">
-    <label for="init_amount">金额</label>
-    <input id="init_amount" name="amount" type="number" step="0.01" required>
-    <label for="init_note">备注</label>
-    <input id="init_note" name="note" type="text" placeholder="可选">
-    <div class="actions">
-      <button class="btn" type="submit">新增初始盈利</button>
-    </div>
-    <p class="muted">日期固定为今日：{{ today_str }}</p>
-  </form>
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr>
-        <th>日期</th>
-        <th>金额</th>
-        <th>备注</th>
-        <th>操作</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for item in initial_profits %}
-        <tr>
-          <td>{{ item['profit_date'] }}</td>
-          <td class="{{ 'profit-positive' if item['amount'] > 0 else 'profit-negative' if item['amount'] < 0 else '' }}">{{ '%.2f'|format(item['amount']) }}</td>
-          <td>{{ item['note'] or '' }}</td>
-          <td>
-            <form method="post" action="{{ url_for('delete_initial_profit', profit_id=item['id']) }}" onsubmit="return confirm('确认删除该记录？');">
-              <button class="btn" type="submit">删除</button>
-            </form>
-          </td>
-        </tr>
-      {% else %}
-        <tr>
-          <td colspan="4">暂无初始盈利记录。</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</section>
-
 <section class="positions">
   <h3>当前持仓</h3>
   <table border="1" cellpadding="6" cellspacing="0">
@@ -108,6 +66,44 @@
       {% else %}
         <tr>
           <td colspan="9">暂无持仓。</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="initial-profit">
+  <h3>初始盈利记录</h3>
+  <form method="post" action="{{ url_for('add_initial_profit') }}" class="initial-form">
+    <label for="init_amount">金额</label>
+    <input id="init_amount" name="amount" type="number" step="0.01" required>
+    <div class="actions">
+      <button class="btn" type="submit">新增初始盈利</button>
+    </div>
+    <p class="muted">日期固定为今日：{{ today_str }}</p>
+  </form>
+  <table border="1" cellpadding="6" cellspacing="0">
+    <thead>
+      <tr>
+        <th>日期</th>
+        <th>金额</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in initial_profits %}
+        <tr>
+          <td>{{ item['profit_date'] }}</td>
+          <td class="{{ 'profit-positive' if item['amount'] > 0 else 'profit-negative' if item['amount'] < 0 else '' }}">{{ '%.2f'|format(item['amount']) }}</td>
+          <td>
+            <form method="post" action="{{ url_for('delete_initial_profit', profit_id=item['id']) }}" onsubmit="return confirm('确认删除该记录？');">
+              <button class="btn" type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr>
+          <td colspan="3">暂无初始盈利记录。</td>
         </tr>
       {% endfor %}
     </tbody>

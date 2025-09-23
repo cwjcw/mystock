@@ -1,6 +1,6 @@
 # Flask API 配置说明
 
-此目录提供了一个可扩展的 Flask API (`fund_flow_api.py`)，用于通过 HTTP 读取 SQLite 数据库中的资金流数据。支持通过配置文件接入多个数据库实例，便于后续扩展。
+此目录提供了一个可扩展的 Flask API (`fund_flow_api.py`)，用于通过 HTTP 读取资金流 MySQL 数据库。
 
 ## 1. 配置文件
 
@@ -12,7 +12,7 @@
   "port": 8800,
   "default_db": "fund_flow",
   "databases": {
-    "fund_flow": "data/stocks.db"
+    "fund_flow": "mysql://mystock:StrongPwd@127.0.0.1:3306/mystock?charset=utf8mb4"
   }
 }
 ```
@@ -20,9 +20,10 @@
 字段含义：
 - `host` / `port`：Flask 应用监听地址和端口。
 - `default_db`：默认数据库标识，未在请求中指定 `db` 参数时使用。
-- `databases`：`标识 -> SQLite 文件路径` 的映射，可扩展多个条目；路径支持 `~` 与环境变量。
+- `databases`：`标识 -> MySQL DSN` 的映射，必须使用 `mysql://user:password@host:port/database?charset=utf8mb4` 形式。
+  - 支持附加参数：`connect_timeout`、`read_timeout`、`write_timeout`、`ssl_ca`、`ssl_cert`、`ssl_key`
 
-如果 `config.json` 不存在，会自动使用默认配置并指向 `data/stocks.db`。
+若 `config.json` 不存在，可通过设置环境变量 `MYSQL_DSN` 提供默认数据源。
 
 ## 2. 启动服务
 
@@ -51,10 +52,10 @@ cp web/config.example.json web/config.json   # 如需自定义
 1. 在 `config.json` 的 `databases` 中新增一项，例如：
    ```json
    "databases": {
-     "fund_flow": "data/stocks.db",
-     "other_data": "/path/to/other.db"
+     "fund_flow": "mysql://mystock:StrongPwd@127.0.0.1:3306/mystock?charset=utf8mb4",
+     "prod": "mysql://reader:AnotherPwd@10.0.0.5:3306/mystock?charset=utf8mb4&ssl_ca=/etc/ssl/certs/ca.pem"
    }
    ```
-2. 请求时通过 `?db=other_data` 选择指定库；若表结构不同，可按同样模式新建 Blueprint / 视图函数以匹配新需求并注册到该 Flask 应用中。
+2. 请求时通过 `?db=prod` 选择指定库；若表结构不同，可按同样模式新建 Blueprint / 视图函数以匹配新需求并注册到该 Flask 应用中。
 
-通过这种方式，即使后续再增加新的 SQLite 数据库，也只需要更新配置并编写相应的路由逻辑即可。
+通过这种方式，即使后续再增加新的 MySQL 数据库，也只需要更新配置并编写相应的路由逻辑即可。

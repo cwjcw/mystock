@@ -3,6 +3,6 @@
   "port": 8800,
   "default_db": "fund_flow",
   "databases": {
-    "fund_flow": "mysql://mystock:StrongPwd@127.0.0.1:3306/mystock?charset=utf8mb4"
+    "fund_flow": "mysql://cwjcw:bj210726@127.0.0.1:3306/mystock?charset=utf8mb4"
   }
 }
