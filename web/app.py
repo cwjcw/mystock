@@ -38,10 +38,10 @@ except ModuleNotFoundError:  # pragma: no cover
 import asyncio
 import aiohttp
 import datetime as dt
+from html import escape
 
 
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
-import xml.etree.ElementTree as ET
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -933,10 +933,10 @@ def generate_rss_response(token: str):
         resp.headers['Retry-After'] = str(retry)
         return resp
 
-    row = _find_user_by_token(token)
-    if not row:
+    user_row = _find_user_by_token(token)
+    if not user_row:
         return ('Not found', 404)
-    items = db_query_all('SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s ORDER BY `id`', (row['id'],))
+    items = db_query_all('SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s ORDER BY `id`', (user_row['id'],))
     watch_entries = [(r['name'] or r['symbol'], r['symbol']) for r in items]
 
     async def build_items():
@@ -987,6 +987,11 @@ def generate_rss_response(token: str):
                 pub_dt = now
                 base_time = now.strftime('%Y-%m-%d %H:%M')
 
+            super_val = rowd.get('超大单')
+            large_val = rowd.get('大单')
+            medium_val = rowd.get('中单')
+            small_val = rowd.get('小单')
+
             aggregated.append({
                 'order': idx,
                 'name': entry['name'],
@@ -998,10 +1003,10 @@ def generate_rss_response(token: str):
                 'market_cap_yi': mcap_yi,
                 'flows': {
                     '主力': rowd.get('主力'),
-                    '超大单': rowd.get('超大单'),
-                    '大单': rowd.get('大单'),
-                    '中单': rowd.get('中单'),
-                    '小单': rowd.get('小单'),
+                    '超大单': small_val,
+                    '大单': medium_val,
+                    '中单': large_val,
+                    '小单': super_val,
                 },
                 'pub_dt': pub_dt,
             })
@@ -1021,43 +1026,51 @@ def generate_rss_response(token: str):
             color = '#c62828' if v > 0 else '#1e7a1e' if v < 0 else '#333'
             return f"<span style='color:{color}'>{v:.2f}{suffix}</span>"
 
+        table_style = "width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;word-break:break-word;"
+        th_style = "style='padding:4px;border:1px solid #ddd;background:#f7f7f7;text-align:left;font-weight:600;'"
+        td_text_style = "style='padding:4px;border:1px solid #ddd;vertical-align:top;line-height:1.4;word-break:break-word;'"
+        td_num_style = "style='padding:4px;border:1px solid #ddd;vertical-align:top;line-height:1.4;text-align:right;white-space:nowrap;'"
+
+        header_titles = ["周期/时间", "最新价", "涨跌幅", "总市值", "主力", "超大单", "大单", "中单", "小单"]
+        header_html = ''.join(f"<th {th_style}>{title}</th>" for title in header_titles)
+
         rows_html = ""
-        for row in aggregated:
-            price_txt = '-' if row['price'] is None else f"{row['price']:.2f}"
-            change_html = '-' if row['change_pct'] is None else color_num(row['change_pct'], '%')
-            mcap_txt = '-' if row['market_cap_yi'] is None else f"{row['market_cap_yi']:.2f}亿"
+
+        for agg in aggregated:
+            price_txt = '-' if agg['price'] is None else f"{agg['price']:.2f}"
+            change_html = '-' if agg['change_pct'] is None else color_num(agg['change_pct'], '%')
+            mcap_txt = '-' if agg['market_cap_yi'] is None else f"{agg['market_cap_yi']:.2f}亿"
             rows_html += (
                 "<tr>"
-                f"<td>{row['name']}<br><span style='color:#888;font-size:0.85em'>{row['symbol']}</span></td>"
-                f"<td>{row['period'] or '-'}<br><span style='color:#888;font-size:0.85em'>{row['time_text']}</span></td>"
-                f"<td>{price_txt}</td>"
-                f"<td>{change_html}</td>"
-                f"<td>{mcap_txt}</td>"
-                f"<td>{color_num(row['flows']['主力'], '亿')}</td>"
-                f"<td>{color_num(row['flows']['超大单'], '亿')}</td>"
-                f"<td>{color_num(row['flows']['大单'], '亿')}</td>"
-                f"<td>{color_num(row['flows']['中单'], '亿')}</td>"
-                f"<td>{color_num(row['flows']['小单'], '亿')}</td>"
+                f"<td {td_text_style}><strong>{agg['period'] or '-'}</strong><br><span style='color:#888;font-size:0.85em'>{agg['time_text']}</span><br><span style='color:#555;font-size:0.85em'>{agg['name']} ({agg['symbol']})</span></td>"
+                f"<td {td_num_style}>{price_txt}</td>"
+                f"<td {td_num_style}>{change_html}</td>"
+                f"<td {td_num_style}>{mcap_txt}</td>"
+                f"<td {td_num_style}>{color_num(agg['flows']['主力'], '亿')}</td>"
+                f"<td {td_num_style}>{color_num(agg['flows']['超大单'], '亿')}</td>"
+                f"<td {td_num_style}>{color_num(agg['flows']['大单'], '亿')}</td>"
+                f"<td {td_num_style}>{color_num(agg['flows']['中单'], '亿')}</td>"
+                f"<td {td_num_style}>{color_num(agg['flows']['小单'], '亿')}</td>"
                 "</tr>"
             )
 
         desc = (
             f"<p>合并覆盖标的：{len(aggregated)} 支</p>"
             f"<p>最新更新时间：{latest_text}</p>"
-            "<table border='1' cellspacing='0' cellpadding='4' style='border-collapse:collapse;font-size:13px;'>"
-            "<tr><th>标的</th><th>周期/时间</th><th>最新价</th><th>涨跌幅</th><th>总市值</th><th>主力</th><th>超大单</th><th>大单</th><th>中单</th><th>小单</th></tr>"
+            f"<table style='{table_style}'>"
+            f"<tr>{header_html}</tr>"
             f"{rows_html}" \
             "</table>"
         )
 
         digest_parts = [
-            f"{row['symbol']}|{row['time_text']}|{row['flows'].get('主力')}|{row['flows'].get('超大单')}|{row['flows'].get('大单')}|{row['flows'].get('中单')}|{row['flows'].get('小单')}"
-            for row in aggregated
+            f"{agg['symbol']}|{agg['time_text']}|{agg['flows'].get('主力')}|{agg['flows'].get('超大单')}|{agg['flows'].get('大单')}|{agg['flows'].get('中单')}|{agg['flows'].get('小单')}"
+            for agg in aggregated
         ]
         guid_hash = hashlib.sha1('||'.join(digest_parts).encode('utf-8')).hexdigest()[:12]
 
         aggregated_item = {
-            'guid': f"fundflow_{row['id']}_{guid_hash}",
+            'guid': f"fundflow_{user_row['id']}_{guid_hash}",
             'title': f"资金流汇总 {latest_text}",
             'description': desc,
             'pubDate': latest_pub.strftime('%a, %d %b %Y %H:%M:%S %z'),
@@ -1067,7 +1080,7 @@ def generate_rss_response(token: str):
 
     items = asyncio.run(build_items())
 
-    snapshot = _get_portfolio_context(row['id'], dt.date.today().replace(month=1, day=1), dt.date.today())
+    snapshot = _get_portfolio_context(user_row['id'], dt.date.today().replace(month=1, day=1), dt.date.today())
     if snapshot:
         positions = snapshot['positions']
 
@@ -1082,17 +1095,43 @@ def generate_rss_response(token: str):
         def fmt_pct(val: Optional[float]) -> str:
             return '-' if val is None else f"{val:.2f}%"
 
+        def color_span(val: Optional[float], suffix: str = '') -> str:
+            if val is None:
+                return '-'
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                return str(val)
+            color = '#c62828' if num > 0 else '#1e7a1e' if num < 0 else '#333'
+            return f"<span style='color:{color}'>{num:.2f}{suffix}</span>"
+
+        table_style = "width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;word-break:break-word;"
+        th_style = "style='padding:4px;border:1px solid #ddd;background:#f7f7f7;text-align:left;font-weight:600;'"
+        td_text_style = "style='padding:4px;border:1px solid #ddd;vertical-align:top;line-height:1.4;word-break:break-word;'"
+        td_num_style = "style='padding:4px;border:1px solid #ddd;vertical-align:top;line-height:1.4;text-align:right;white-space:nowrap;'"
+
+        header_titles = ["名称", "最新价", "涨跌幅", "市值", "持仓盈亏", "持仓盈亏%", "当日收益"]
+        header_html = ''.join(f"<th {th_style}>{title}</th>" for title in header_titles)
+
         table_rows = ""
         for pos in positions[:10]:
+            price_val = pos['price']
+            price_txt = '-' if price_val is None else f"{price_val:.2f}"
+            change_cell = color_span(pos['change_pct'], suffix='%')
+            market_txt = fmt_currency(pos['market_value'])
+            unrealized_cell = color_span(pos['unrealized'])
+            unrealized_pct_val = None if pos['unrealized'] is None or pos['cost_basis'] in (None, 0) else (pos['unrealized'] / pos['cost_basis']) * 100
+            unrealized_pct_cell = color_span(unrealized_pct_val, suffix='%') if unrealized_pct_val is not None else '-'
+            daily_cell = color_span(pos['daily_change'])
             table_rows += (
                 "<tr>"
-                f"<td>{pos['name'] or pos['symbol']}</td>"
-                f"<td>{'-' if pos['price'] is None else f'{pos['price']:.2f}'}</td>"
-                f"<td>{fmt_pct(pos['change_pct'])}</td>"
-                f"<td>{fmt_currency(pos['market_value'])}</td>"
-                f"<td>{fmt_currency(pos['unrealized'])}</td>"
-                f"<td>{fmt_pct(None if pos['unrealized'] is None or pos['cost_basis'] in (None, 0) else (pos['unrealized'] / pos['cost_basis']) * 100)}</td>"
-                f"<td>{fmt_currency(pos['daily_change'])}</td>"
+                f"<td {td_text_style}>{pos['name'] or pos['symbol']}</td>"
+                f"<td {td_num_style}>{price_txt}</td>"
+                f"<td {td_num_style}>{change_cell}</td>"
+                f"<td {td_num_style}>{market_txt}</td>"
+                f"<td {td_num_style}>{unrealized_cell}</td>"
+                f"<td {td_num_style}>{unrealized_pct_cell}</td>"
+                f"<td {td_num_style}>{daily_cell}</td>"
                 "</tr>"
             )
 
@@ -1100,15 +1139,15 @@ def generate_rss_response(token: str):
             f"<p>周期盈亏：{fmt_currency(snapshot['realized_with_initial'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
             f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元)</p>"
-            "<table border='1' cellspacing='0' cellpadding='4'>"
-            "<tr><th>名称</th><th>最新价</th><th>涨跌幅</th><th>市值</th><th>持仓盈亏</th><th>持仓盈亏%</th><th>当日收益</th></tr>"
+            f"<table style='{table_style}'>"
+            f"<tr>{header_html}</tr>"
             f"{table_rows}" \
             "</table>"
         )
 
         timestamp = dt.datetime.now(CHINA_TZ)
         portfolio_item = {
-            'guid': f"portfolio_{row['id']}_{timestamp.strftime('%Y%m%d%H%M%S')}",
+            'guid': f"portfolio_{user_row['id']}_{timestamp.strftime('%Y%m%d%H%M%S')}",
             'title': f"持仓与盈亏 {timestamp.strftime('%Y-%m-%d %H:%M')}",
             'description': portfolio_desc,
             'pubDate': timestamp.strftime('%a, %d %b %Y %H:%M:%S %z'),
@@ -1116,22 +1155,36 @@ def generate_rss_response(token: str):
         }
         items.insert(0, portfolio_item)
     # Build RSS XML
-    rss = ET.Element('rss', version='2.0')
-    ch = ET.SubElement(rss, 'channel')
-    ET.SubElement(ch, 'title').text = f"资金流RSS - {row['username']}"
-    ET.SubElement(ch, 'link').text = 'https://quote.eastmoney.com/'
-    ET.SubElement(ch, 'description').text = 'A股分钟级资金流'
-    ET.SubElement(ch, 'lastBuildDate').text = dt.datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z')
+    def _wrap_cdata(text: str) -> str:
+        safe = text.replace(']]>', ']]]]><![CDATA[>')
+        return f"<![CDATA[{safe}]]>"
+
+    now_text = dt.datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z')
+    feed_title = f"资金流RSS - {user_row['username']}"
+    parts = [
+        "<?xml version='1.0' encoding='utf-8'?>",
+        "<rss version=\"2.0\"><channel>",
+        f"<title>{escape(feed_title)}</title>",
+        "<link>https://quote.eastmoney.com/</link>",
+        "<description>A股分钟级资金流</description>",
+        f"<lastBuildDate>{escape(now_text)}</lastBuildDate>",
+    ]
+
     for it in items:
-        item = ET.SubElement(ch, 'item')
-        ET.SubElement(item, 'title').text = it['title']
-        ET.SubElement(item, 'description').text = it['description']
-        ET.SubElement(item, 'link').text = it['link']
-        guid_el = ET.SubElement(item, 'guid')
-        guid_el.text = it['guid']
-        guid_el.set('isPermaLink', 'false')
-        ET.SubElement(item, 'pubDate').text = it['pubDate']
-    xml = ET.tostring(rss, encoding='utf-8', xml_declaration=True)
+        parts.extend(
+            [
+                "<item>",
+                f"<title>{escape(it['title'])}</title>",
+                f"<description>{_wrap_cdata(it['description'])}</description>",
+                f"<link>{escape(it['link'])}</link>",
+                f"<guid isPermaLink=\"false\">{escape(it['guid'])}</guid>",
+                f"<pubDate>{escape(it['pubDate'])}</pubDate>",
+                "</item>",
+            ]
+        )
+
+    parts.append("</channel></rss>")
+    xml = ''.join(parts).encode('utf-8')
     resp = make_response(xml)
     resp.headers['Content-Type'] = 'application/rss+xml; charset=utf-8'
     return resp
