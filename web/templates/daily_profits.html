@@ -1,0 +1,132 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>每日盈亏概览</h2>
+<form method="get" class="pnl-form range">
+  <label for="start">开始日期</label>
+  <input id="start" name="start" type="date" value="{{ start_date }}">
+  <label for="end">结束日期</label>
+  <input id="end" name="end" type="date" value="{{ end_date }}">
+  <div class="actions">
+    <button class="btn" type="submit">筛选</button>
+  </div>
+</form>
+
+<section class="profit-overview">
+  <ul class="profit-list">
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">区间天数</span>
+        <span class="profit-value">{{ records|length }} 天</span>
+      </div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">盈亏合计</span>
+        {% set total_class = 'profit-positive' if total_amount > 0 else 'profit-negative' if total_amount < 0 else '' %}
+        <span class="profit-value profit-sm {{ total_class }}">{{ '{:,.0f}'.format(total_amount) if total_amount is not none else '-' }} 元</span>
+      </div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">平均盈亏比例</span>
+        {% set avg_ratio_class = 'profit-positive' if average_ratio and average_ratio > 0 else 'profit-negative' if average_ratio and average_ratio < 0 else '' %}
+        <span class="profit-value profit-sm {{ avg_ratio_class }}">{{ '-' if average_ratio is none else '%.1f'|format(average_ratio) ~ '%' }}</span>
+      </div>
+    </li>
+  </ul>
+</section>
+
+<section>
+  <canvas id="profitChart" height="220"></canvas>
+</section>
+
+<section class="positions" style="margin-top:1.5rem;">
+  <h3>每日盈亏明细</h3>
+  <div class="history">
+    <table class="history-table" border="1" cellpadding="6" cellspacing="0">
+      <thead>
+        <tr>
+          <th>日期</th>
+          <th>盈亏金额</th>
+          <th>盈亏比例</th>
+          <th>总市值</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for rec in records %}
+          {% set amount = rec.amount if rec.amount is not none else None %}
+          {% set ratio = rec.ratio if rec.ratio is not none else None %}
+          <tr>
+            <td>{{ rec.date }}</td>
+            <td class="{{ 'profit-positive' if amount and amount > 0 else 'profit-negative' if amount and amount < 0 else '' }}">{{ '-' if amount is none else '{:,.0f}'.format(amount) }}</td>
+            <td class="{{ 'profit-positive' if ratio and ratio > 0 else 'profit-negative' if ratio and ratio < 0 else '' }}">{{ '-' if ratio is none else '%.1f'|format(ratio) ~ '%' }}</td>
+            <td>{{ '-' if rec.total_market_value is none else '%.2f'|format(rec.total_market_value) }}</td>
+          </tr>
+        {% else %}
+          <tr>
+            <td colspan="4">暂无记录。</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+  const labels = {{ labels|tojson }};
+  const amounts = {{ amounts|tojson }};
+  const ratios = {{ ratios|tojson }};
+  const ctx = document.getElementById('profitChart').getContext('2d');
+  const chartData = {
+    labels,
+    datasets: [
+      {
+        label: '盈亏金额 (元)',
+        data: amounts,
+        borderColor: '#c62828',
+        backgroundColor: 'rgba(198, 40, 40, 0.15)',
+        yAxisID: 'y',
+        tension: 0.2,
+        fill: true
+      },
+      {
+        label: '盈亏比例 (%)',
+        data: ratios,
+        borderColor: '#1976d2',
+        backgroundColor: 'rgba(25, 118, 210, 0.15)',
+        yAxisID: 'y1',
+        tension: 0.2,
+        fill: false
+      }
+    ]
+  };
+  new Chart(ctx, {
+    type: 'line',
+    data: chartData,
+    options: {
+      responsive: true,
+      interaction: {
+        mode: 'index',
+        intersect: false
+      },
+      stacked: false,
+      scales: {
+        y: {
+          type: 'linear',
+          display: true,
+          position: 'left',
+          title: { display: true, text: '金额 (元)' }
+        },
+        y1: {
+          type: 'linear',
+          display: true,
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          title: { display: true, text: '比例 (%)' }
+        }
+      }
+    }
+  });
+</script>
+{% endblock %}

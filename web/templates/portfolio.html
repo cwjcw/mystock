@@ -12,6 +12,26 @@
 </form>
 
 <section class="profit-overview">
+  {% set unrealized_ratio_text = '-' %}
+  {% set unrealized_ratio_class = '' %}
+  {% if unrealized_ratio is not none %}
+    {% set unrealized_ratio_text = '%.2f'|format(unrealized_ratio) ~ '%' %}
+    {% if unrealized_ratio > 0 %}
+      {% set unrealized_ratio_class = 'profit-positive' %}
+    {% elif unrealized_ratio < 0 %}
+      {% set unrealized_ratio_class = 'profit-negative' %}
+    {% endif %}
+  {% endif %}
+  {% set daily_ratio_text = '-' %}
+  {% set daily_ratio_class = '' %}
+  {% if daily_ratio is not none %}
+    {% set daily_ratio_text = '%.2f'|format(daily_ratio) ~ '%' %}
+    {% if daily_ratio > 0 %}
+      {% set daily_ratio_class = 'profit-positive' %}
+    {% elif daily_ratio < 0 %}
+      {% set daily_ratio_class = 'profit-negative' %}
+    {% endif %}
+  {% endif %}
   <ul class="profit-list">
     <li class="profit-item">
       <div class="profit-line">
@@ -31,6 +51,7 @@
         <span class="profit-label">持仓盈亏</span>
         <span class="profit-value {{ 'profit-positive' if unrealized_total > 0 else 'profit-negative' if unrealized_total < 0 else '' }}">{{ '%.2f'|format(unrealized_total) }} 元</span>
       </div>
+      <div class="profit-secondary">比例：<span class="{{ unrealized_ratio_class }}">{{ unrealized_ratio_text }}</span></div>
       <div class="profit-extra">
         <div>成本：{{ '%.2f'|format(total_cost_basis) }} 元</div>
         <div>市值：{{ '%.2f'|format(total_market_value) }} 元</div>
@@ -41,6 +62,7 @@
         <span class="profit-label">当日盈亏</span>
         <span class="profit-value {{ 'profit-positive' if daily_total > 0 else 'profit-negative' if daily_total < 0 else '' }}">{{ '%.2f'|format(daily_total) }} 元</span>
       </div>
+      <div class="profit-secondary">比例：<span class="{{ daily_ratio_class }}">{{ daily_ratio_text }}</span></div>
       {% set daily_stock_class = 'profit-positive' if daily_stock_pnl > 0 else 'profit-negative' if daily_stock_pnl < 0 else '' %}
       {% set daily_fund_class = 'profit-positive' if daily_fund_pnl > 0 else 'profit-negative' if daily_fund_pnl < 0 else '' %}
       <div class="profit-extra">

@@ -178,6 +178,22 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `daily_profit_snapshots` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `snapshot_date` DATE NOT NULL,
+                    `amount` DOUBLE NOT NULL,
+                    `ratio` DOUBLE DEFAULT NULL,
+                    `total_market_value` DOUBLE DEFAULT NULL,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uniq_user_date` (`user_id`, `snapshot_date`),
+                    CONSTRAINT `fk_daily_profit_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
 
         # Backfill columns if missing
         with conn.cursor() as cur:
@@ -589,6 +605,13 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
     realized_with_initial = portfolio['realized_total'] + initial_period_total
     combined_total = realized_with_initial + unrealized_total
     daily_total = daily_stock_pnl + daily_fund_pnl
+    base_for_daily_ratio = total_market_value if abs(total_market_value) > 1e-9 else total_cost_basis
+    daily_ratio = None
+    if base_for_daily_ratio and abs(base_for_daily_ratio) > 1e-9:
+        daily_ratio = (daily_total / base_for_daily_ratio) * 100
+    unrealized_ratio = None
+    if total_cost_basis and abs(total_cost_basis) > 1e-9:
+        unrealized_ratio = (unrealized_total / total_cost_basis) * 100
 
     return {
         'positions': positions,
@@ -605,7 +628,68 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'daily_stock_pnl': daily_stock_pnl,
         'daily_fund_pnl': daily_fund_pnl,
         'daily_total': daily_total,
+        'daily_ratio': daily_ratio,
+        'unrealized_ratio': unrealized_ratio,
     }
+
+
+def _record_daily_snapshot(user_id: int, snapshot: Optional[dict] = None, snapshot_date: Optional[dt.date] = None) -> bool:
+    target_date = snapshot_date or dt.datetime.now(CHINA_TZ).date()
+    data = snapshot
+    if data is None:
+        data = _get_portfolio_context(user_id, target_date.replace(month=1, day=1), target_date)
+    if not data:
+        return False
+    db_execute(
+        'INSERT INTO `daily_profit_snapshots` (`user_id`, `snapshot_date`, `amount`, `ratio`, `total_market_value`) '
+        'VALUES (%s, %s, %s, %s, %s) '
+        'ON DUPLICATE KEY UPDATE `amount` = VALUES(`amount`), `ratio` = VALUES(`ratio`), `total_market_value` = VALUES(`total_market_value`), `updated_at` = CURRENT_TIMESTAMP',
+        (
+            user_id,
+            target_date,
+            data.get('daily_total'),
+            data.get('daily_ratio'),
+            data.get('total_market_value'),
+        ),
+    )
+    return True
+
+
+def _record_daily_snapshots_for_all_users(snapshot_date: Optional[dt.date] = None) -> None:
+    target_date = snapshot_date or dt.datetime.now(CHINA_TZ).date()
+    users = db_query_all('SELECT `id` FROM `users`')
+    for row in users:
+        try:
+            _record_daily_snapshot(row['id'], snapshot_date=target_date)
+        except Exception:
+            app.logger.exception('记录用户 %s 的每日盈亏数据失败', row['id'])
+
+
+_DAILY_SNAPSHOT_THREAD_STARTED = False
+
+
+def _start_daily_snapshot_worker() -> None:
+    global _DAILY_SNAPSHOT_THREAD_STARTED
+    if _DAILY_SNAPSHOT_THREAD_STARTED:
+        return
+
+    def _worker() -> None:
+        last_recorded: Optional[dt.date] = None
+        interval = max(120, int(os.environ.get('DAILY_SNAPSHOT_INTERVAL', '600')))
+        while True:
+            current = dt.datetime.now(CHINA_TZ).date()
+            if current != last_recorded:
+                try:
+                    with app.app_context():
+                        _record_daily_snapshots_for_all_users(current)
+                        last_recorded = current
+                except Exception:
+                    app.logger.exception('每日盈亏写入线程执行失败')
+            time.sleep(interval)
+
+    thread = threading.Thread(target=_worker, name='DailySnapshotWorker', daemon=True)
+    thread.start()
+    _DAILY_SNAPSHOT_THREAD_STARTED = True
 
 
 @app.route('/watchlist', methods=['GET', 'POST'])
@@ -859,6 +943,67 @@ def portfolio_view():
         daily_stock_pnl=context['daily_stock_pnl'],
         daily_fund_pnl=context['daily_fund_pnl'],
         daily_total=context['daily_total'],
+        daily_ratio=context['daily_ratio'],
+        unrealized_ratio=context['unrealized_ratio'],
+    )
+
+
+@app.route('/daily_profits', methods=['GET'])
+@login_required
+def daily_profits_view():
+    today = dt.date.today()
+    default_start = today - dt.timedelta(days=29)
+    start_raw = request.args.get('start') or default_start.isoformat()
+    end_raw = request.args.get('end') or today.isoformat()
+    start_date = _parse_iso_date(start_raw) or default_start
+    end_date = _parse_iso_date(end_raw) or today
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    rows = db_query_all(
+        'SELECT `snapshot_date`, `amount`, `ratio`, `total_market_value` '
+        'FROM `daily_profit_snapshots` WHERE `user_id` = %s AND `snapshot_date` BETWEEN %s AND %s '
+        'ORDER BY `snapshot_date` ASC',
+        (current_user.id, start_date, end_date),
+    )
+
+    records = []
+    for row in rows:
+        snap_date = row['snapshot_date']
+        amount = row['amount']
+        ratio = row['ratio']
+        total_mv = row['total_market_value']
+        records.append(
+            {
+                'date': snap_date.isoformat() if hasattr(snap_date, 'isoformat') else str(snap_date),
+                'amount': float(amount) if amount is not None else None,
+                'ratio': float(ratio) if ratio is not None else None,
+                'total_market_value': float(total_mv) if total_mv is not None else None,
+            }
+        )
+
+    labels = [rec['date'] for rec in records]
+    chart_amounts = [rec['amount'] if rec['amount'] is not None else 0 for rec in records]
+    chart_ratios = [rec['ratio'] for rec in records]
+
+    amount_values = [rec['amount'] for rec in records if rec['amount'] is not None]
+    market_values = [rec['total_market_value'] for rec in records if rec['total_market_value'] is not None]
+    total_amount = sum(amount_values)
+    total_market_value = sum(market_values)
+    average_ratio = None
+    if total_market_value and abs(total_market_value) > 1e-9:
+        average_ratio = (total_amount / total_market_value) * 100
+
+    return render_template(
+        'daily_profits.html',
+        records=records,
+        labels=labels,
+        amounts=chart_amounts,
+        ratios=chart_ratios,
+        total_amount=total_amount,
+        average_ratio=average_ratio,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
     )
 
 
@@ -1040,9 +1185,10 @@ def generate_rss_response(token: str):
             price_txt = '-' if agg['price'] is None else f"{agg['price']:.2f}"
             change_html = '-' if agg['change_pct'] is None else color_num(agg['change_pct'], '%')
             mcap_txt = '-' if agg['market_cap_yi'] is None else f"{agg['market_cap_yi']:.2f}亿"
+            name_line = agg['name'] or ''
             rows_html += (
                 "<tr>"
-                f"<td {td_text_style}><strong>{agg['period'] or '-'}</strong><br><span style='color:#888;font-size:0.85em'>{agg['time_text']}</span><br><span style='color:#555;font-size:0.85em'>{agg['name']} ({agg['symbol']})</span></td>"
+                f"<td {td_text_style}><strong>{agg['period'] or '-'}</strong><br><span style='color:#888;font-size:0.85em'>{agg['time_text']}</span><br><span style='color:#555;font-size:0.85em'>{name_line}</span></td>"
                 f"<td {td_num_style}>{price_txt}</td>"
                 f"<td {td_num_style}>{change_html}</td>"
                 f"<td {td_num_style}>{mcap_txt}</td>"
@@ -1082,6 +1228,7 @@ def generate_rss_response(token: str):
 
     snapshot = _get_portfolio_context(user_row['id'], dt.date.today().replace(month=1, day=1), dt.date.today())
     if snapshot:
+        _record_daily_snapshot(user_row['id'], snapshot=snapshot)
         positions = snapshot['positions']
 
         def fmt_currency(val: Optional[float]) -> str:
@@ -1110,7 +1257,7 @@ def generate_rss_response(token: str):
         td_text_style = "style='padding:4px;border:1px solid #ddd;vertical-align:top;line-height:1.4;word-break:break-word;'"
         td_num_style = "style='padding:4px;border:1px solid #ddd;vertical-align:top;line-height:1.4;text-align:right;white-space:nowrap;'"
 
-        header_titles = ["名称", "最新价", "涨跌幅", "市值", "持仓盈亏", "持仓盈亏%", "当日收益"]
+        header_titles = ["名称", "最新价", "涨跌幅", "市值", "持仓盈亏", "持仓盈亏%", "当日收益", "当日收益%"]
         header_html = ''.join(f"<th {th_style}>{title}</th>" for title in header_titles)
 
         table_rows = ""
@@ -1120,9 +1267,17 @@ def generate_rss_response(token: str):
             change_cell = color_span(pos['change_pct'], suffix='%')
             market_txt = fmt_currency(pos['market_value'])
             unrealized_cell = color_span(pos['unrealized'])
-            unrealized_pct_val = None if pos['unrealized'] is None or pos['cost_basis'] in (None, 0) else (pos['unrealized'] / pos['cost_basis']) * 100
+            cost_basis_val = pos['cost_basis']
+            unrealized_pct_val = None if pos['unrealized'] is None or cost_basis_val in (None, 0) else (pos['unrealized'] / cost_basis_val) * 100
             unrealized_pct_cell = color_span(unrealized_pct_val, suffix='%') if unrealized_pct_val is not None else '-'
-            daily_cell = color_span(pos['daily_change'])
+            daily_change_val = pos['daily_change']
+            daily_cell = color_span(daily_change_val)
+            daily_pct_val = None
+            if daily_change_val is not None:
+                base = cost_basis_val if cost_basis_val not in (None, 0) else pos['market_value']
+                if base not in (None, 0):
+                    daily_pct_val = (daily_change_val / base) * 100
+            daily_pct_cell = color_span(daily_pct_val, suffix='%') if daily_pct_val is not None else '-'
             table_rows += (
                 "<tr>"
                 f"<td {td_text_style}>{pos['name'] or pos['symbol']}</td>"
@@ -1132,13 +1287,15 @@ def generate_rss_response(token: str):
                 f"<td {td_num_style}>{unrealized_cell}</td>"
                 f"<td {td_num_style}>{unrealized_pct_cell}</td>"
                 f"<td {td_num_style}>{daily_cell}</td>"
+                f"<td {td_num_style}>{daily_pct_cell}</td>"
                 "</tr>"
             )
 
+        daily_ratio_txt = fmt_pct(snapshot.get('daily_ratio'))
         portfolio_desc = (
             f"<p>周期盈亏：{fmt_currency(snapshot['realized_with_initial'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
-            f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元)</p>"
+            f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元；比例：{daily_ratio_txt})</p>"
             f"<table style='{table_style}'>"
             f"<tr>{header_html}</tr>"
             f"{table_rows}" \
@@ -1208,6 +1365,16 @@ def prefixed_rss(prefix: str, token: str):
         if prefix != RSS_PREFIX:
             return ('Not found', 404)
     return generate_rss_response(token)
+
+
+if os.environ.get('DISABLE_DAILY_SNAPSHOT_WORKER') != '1':
+    should_start_worker = True
+    if app.debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        should_start_worker = False
+    if app.config.get('TESTING'):
+        should_start_worker = False
+    if should_start_worker:
+        _start_daily_snapshot_worker()
 
 
 if __name__ == '__main__':
