@@ -201,6 +201,8 @@ def init_db():
             user_cols = {row['Field'] for row in cur.fetchall()}
             if 'rss_token_hash' not in user_cols:
                 cur.execute("ALTER TABLE `users` ADD COLUMN `rss_token_hash` VARCHAR(255)")
+            if 'serverchan_send_key' not in user_cols:
+                cur.execute("ALTER TABLE `users` ADD COLUMN `serverchan_send_key` VARCHAR(255)")
 
             cur.execute("SHOW COLUMNS FROM `trade_logs`")
             trade_cols = {row['Field'] for row in cur.fetchall()}
@@ -220,21 +222,28 @@ login_manager.login_view = 'login'
 
 
 class User(UserMixin):
-    def __init__(self, id, username, password_hash, rss_token):
+    def __init__(self, id, username, password_hash, rss_token, serverchan_send_key):
         self.id = id
         self.username = username
         self.password_hash = password_hash
         self.rss_token = rss_token
+        self.serverchan_send_key = serverchan_send_key
 
 
 @login_manager.user_loader
 def load_user(user_id):
     row = db_query_one(
-        'SELECT `id`, `username`, `password_hash`, `rss_token` FROM `users` WHERE `id` = %s',
+        'SELECT `id`, `username`, `password_hash`, `rss_token`, `serverchan_send_key` FROM `users` WHERE `id` = %s',
         (user_id,),
     )
     if row:
-        return User(row['id'], row['username'], row['password_hash'], row['rss_token'])
+        return User(
+            row['id'],
+            row['username'],
+            row['password_hash'],
+            row['rss_token'],
+            row.get('serverchan_send_key'),
+        )
     return None
 
 
@@ -311,10 +320,16 @@ def register():
             flash('下次若遗失可在“我的股票”页面重置 Token。', 'success')
             # 直接登录并跳转到watchlist，方便复制
             row = db_query_one(
-                'SELECT `id`, `username`, `password_hash`, `rss_token`, `rss_token_hash` FROM `users` WHERE `username` = %s',
+                'SELECT `id`, `username`, `password_hash`, `rss_token`, `rss_token_hash`, `serverchan_send_key` FROM `users` WHERE `username` = %s',
                 (username,),
             )
-            user = User(row['id'], row['username'], row['password_hash'], row['rss_token'])
+            user = User(
+                row['id'],
+                row['username'],
+                row['password_hash'],
+                row['rss_token'],
+                row.get('serverchan_send_key'),
+            )
             login_user(user)
             return redirect(url_for('watchlist_view'))
         else:
@@ -329,13 +344,19 @@ def login():
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
         row = db_query_one(
-            'SELECT `id`, `username`, `password_hash`, `rss_token` FROM `users` WHERE `username` = %s',
+            'SELECT `id`, `username`, `password_hash`, `rss_token`, `serverchan_send_key` FROM `users` WHERE `username` = %s',
             (username,),
         )
         if not row or not check_password_hash(row['password_hash'], password):
             flash('用户名或密码错误', 'error')
             return render_template('login.html')
-        user = User(row['id'], row['username'], row['password_hash'], row['rss_token'])
+        user = User(
+            row['id'],
+            row['username'],
+            row['password_hash'],
+            row['rss_token'],
+            row.get('serverchan_send_key'),
+        )
         login_user(user)
         return redirect(url_for('watchlist_view'))
     return render_template('login.html')
@@ -697,6 +718,7 @@ def _start_daily_snapshot_worker() -> None:
 def watchlist_view():
     if request.method == 'POST':
         raw = request.form.get('symbols', '')
+        send_key = request.form.get('serverchan_send_key', '').strip()
         items = _parse_symbols(raw)
         db_execute('DELETE FROM `watchlist` WHERE `user_id` = %s', (current_user.id,))
         payload = [(current_user.id, it['symbol'], it['name']) for it in items]
@@ -704,6 +726,11 @@ def watchlist_view():
             'INSERT INTO `watchlist` (`user_id`, `symbol`, `name`) VALUES (%s, %s, %s)',
             payload,
         )
+        db_execute(
+            'UPDATE `users` SET `serverchan_send_key` = %s WHERE `id` = %s',
+            (send_key or None, current_user.id),
+        )
+        current_user.serverchan_send_key = send_key or None
         flash('已保存股票列表', 'success')
         return redirect(url_for('watchlist_view'))
 
@@ -721,6 +748,7 @@ def watchlist_view():
         public_domain=PUBLIC_DOMAIN,
         rss_prefix=resolved_prefix,
         hash_only=RSS_TOKEN_HASH_ONLY,
+        serverchan_send_key=current_user.serverchan_send_key or '',
     )
 
 

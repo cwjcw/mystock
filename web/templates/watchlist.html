@@ -2,6 +2,9 @@
 {% block content %}
 <h2>我的股票</h2>
 <form method="post">
+  <label for="serverchan_send_key">Server酱 SendKey</label>
+  <input type="text" name="serverchan_send_key" id="serverchan_send_key" placeholder="SCTxxxxxxxx" value="{{ serverchan_send_key }}">
+  <small>用于接收资金流入提醒，每位用户可配置独立的 SendKey，留空则不推送。</small>
   <label>每行一个；支持 “名称=代码” 或直接输入6位代码（自动识别沪/深）。</label>
   <small>示例：<code>000981</code>（自动转为 <code>000981.SZ</code>），或 <code>山子高科=000981</code>。多个股票请换行输入。</small>
   <textarea name="symbols" placeholder="000981
