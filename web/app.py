@@ -4,6 +4,7 @@ import hashlib
 import time
 import threading
 import math
+from functools import wraps
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -119,6 +120,16 @@ def close_db(e=None):
             pass
 
 
+def manager_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not current_user.is_authenticated or not getattr(current_user, 'is_manager', False):
+            abort(403)
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
 def init_db():
     conn = connect_mysql(APP_DB_DSN, cursorclass=DictCursor)
     try:
@@ -131,6 +142,7 @@ def init_db():
                     `password_hash` VARCHAR(255) NOT NULL,
                     `rss_token` VARCHAR(255) UNIQUE,
                     `rss_token_hash` VARCHAR(255),
+                    `role` VARCHAR(32) NOT NULL DEFAULT 'user',
                     `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
@@ -203,6 +215,8 @@ def init_db():
                 cur.execute("ALTER TABLE `users` ADD COLUMN `rss_token_hash` VARCHAR(255)")
             if 'serverchan_send_key' not in user_cols:
                 cur.execute("ALTER TABLE `users` ADD COLUMN `serverchan_send_key` VARCHAR(255)")
+            if 'role' not in user_cols:
+                cur.execute("ALTER TABLE `users` ADD COLUMN `role` VARCHAR(32) NOT NULL DEFAULT 'user'")
 
             cur.execute("SHOW COLUMNS FROM `trade_logs`")
             trade_cols = {row['Field'] for row in cur.fetchall()}
@@ -210,6 +224,83 @@ def init_db():
                 cur.execute("ALTER TABLE `trade_logs` ADD COLUMN `asset_type` VARCHAR(32) NOT NULL DEFAULT 'stock'")
             if 'stamp_tax' not in trade_cols:
                 cur.execute("ALTER TABLE `trade_logs` ADD COLUMN `stamp_tax` DOUBLE NOT NULL DEFAULT 0")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_holdings` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `shares` DOUBLE NOT NULL,
+                    `cost_amount` DOUBLE NOT NULL,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uniq_user` (`user_id`),
+                    CONSTRAINT `fk_fund_holdings_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_nav_history` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `snapshot_time` DATETIME NOT NULL,
+                    `nav` DOUBLE NOT NULL,
+                    `total_assets` DOUBLE NOT NULL,
+                    `total_shares` DOUBLE NOT NULL,
+                    `cash_amount` DOUBLE NOT NULL,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_position_history` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `nav_id` INT NOT NULL,
+                    `symbol` VARCHAR(32) NOT NULL,
+                    `name` VARCHAR(255),
+                    `market_value` DOUBLE NOT NULL,
+                    `weight` DOUBLE NOT NULL,
+                    CONSTRAINT `fk_position_nav` FOREIGN KEY (`nav_id`) REFERENCES `fund_nav_history`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_cash_adjustments` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `amount` DOUBLE NOT NULL,
+                    `note` VARCHAR(255),
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `operator_id` INT,
+                    CONSTRAINT `fk_cash_operator` FOREIGN KEY (`operator_id`) REFERENCES `users`(`id`) ON DELETE SET NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_settings` (
+                    `key` VARCHAR(64) PRIMARY KEY,
+                    `value` TEXT,
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute('SELECT `id` FROM `users` WHERE `username` = %s', ('manager',))
+            exists = cur.fetchone()
+            if not exists:
+                password = generate_password_hash('weijie81')
+                cur.execute(
+                    'INSERT INTO `users` (`username`, `password_hash`, `role`) VALUES (%s, %s, %s)',
+                    ('manager', password, 'manager'),
+                )
         conn.commit()
     finally:
         conn.close()
@@ -222,18 +313,23 @@ login_manager.login_view = 'login'
 
 
 class User(UserMixin):
-    def __init__(self, id, username, password_hash, rss_token, serverchan_send_key):
+    def __init__(self, id, username, password_hash, rss_token, serverchan_send_key, role='user'):
         self.id = id
         self.username = username
         self.password_hash = password_hash
         self.rss_token = rss_token
         self.serverchan_send_key = serverchan_send_key
+        self.role = role or 'user'
+
+    @property
+    def is_manager(self) -> bool:
+        return self.role == 'manager'
 
 
 @login_manager.user_loader
 def load_user(user_id):
     row = db_query_one(
-        'SELECT `id`, `username`, `password_hash`, `rss_token`, `serverchan_send_key` FROM `users` WHERE `id` = %s',
+        'SELECT `id`, `username`, `password_hash`, `rss_token`, `serverchan_send_key`, `role` FROM `users` WHERE `id` = %s',
         (user_id,),
     )
     if row:
@@ -243,6 +339,7 @@ def load_user(user_id):
             row['password_hash'],
             row['rss_token'],
             row.get('serverchan_send_key'),
+            row.get('role', 'user'),
         )
     return None
 
@@ -278,6 +375,157 @@ def db_executemany(sql: str, params_seq: List[tuple]) -> None:
     conn = get_db()
     with conn.cursor() as cur:
         cur.executemany(sql, params_seq)
+
+
+def get_fund_setting(key: str) -> Optional[str]:
+    row = db_query_one('SELECT `value` FROM `fund_settings` WHERE `key` = %s', (key,))
+    if row:
+        return row['value']
+    return None
+
+
+def set_fund_setting(key: str, value: str) -> None:
+    db_execute(
+        'INSERT INTO `fund_settings` (`key`, `value`) VALUES (%s, %s) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)',
+        (key, value),
+    )
+
+
+def get_cash_balance() -> float:
+    row = db_query_one('SELECT COALESCE(SUM(`amount`), 0) AS total FROM `fund_cash_adjustments`')
+    if row and row['total'] is not None:
+        return float(row['total'])
+    return 0.0
+
+
+def get_latest_nav_record() -> Optional[Dict]:
+    return db_query_one(
+        'SELECT `id`, `snapshot_time`, `nav`, `total_assets`, `total_shares`, `cash_amount` FROM `fund_nav_history` ORDER BY `snapshot_time` DESC LIMIT 1'
+    )
+
+
+def get_user_id_by_username(username: str) -> Optional[int]:
+    row = db_query_one('SELECT `id` FROM `users` WHERE `username` = %s', (username,))
+    if row:
+        return int(row['id'])
+    return None
+
+
+def build_fund_snapshot() -> Optional[Dict]:
+    base_user_id = get_user_id_by_username('cwjcw')
+    if not base_user_id:
+        return None
+
+    context = _get_portfolio_context(base_user_id, dt.date(2000, 1, 1), dt.date.today())
+    positions = context.get('positions', []) if context else []
+
+    enriched_positions: List[Dict] = []
+    total_stock_value = 0.0
+    for pos in positions:
+        market_value = pos.get('market_value')
+        if market_value is None:
+            market_value = 0.0
+        total_stock_value += market_value
+        enriched_positions.append(
+            {
+                'symbol': pos.get('symbol'),
+                'name': pos.get('name') or pos.get('symbol'),
+                'market_value': market_value,
+            }
+        )
+
+    cash_balance = get_cash_balance()
+    total_assets = total_stock_value + cash_balance
+
+    row = db_query_one('SELECT COALESCE(SUM(`shares`), 0) AS total_shares FROM `fund_holdings`')
+    total_shares = float(row['total_shares']) if row and row['total_shares'] is not None else 0.0
+    nav = (total_assets / total_shares) if total_shares > 0 else 0.0
+
+    total_denom = total_assets if total_assets > 0 else 1.0
+    positions_with_weights: List[Dict] = []
+    for pos in enriched_positions:
+        positions_with_weights.append(
+            {
+                'symbol': pos['symbol'],
+                'name': pos['name'],
+                'market_value': pos['market_value'],
+                'weight': pos['market_value'] / total_denom if total_denom else 0.0,
+            }
+        )
+
+    positions_with_weights.append(
+        {
+            'symbol': 'CASH',
+            'name': '现金',
+            'market_value': cash_balance,
+            'weight': cash_balance / total_denom if total_denom else 0.0,
+        }
+    )
+
+    snapshot_time = dt.datetime.now(CHINA_TZ).replace(tzinfo=None)
+
+    return {
+        'snapshot_time': snapshot_time,
+        'nav': nav,
+        'total_assets': total_assets,
+        'total_shares': total_shares,
+        'cash_amount': cash_balance,
+        'positions': positions_with_weights,
+    }
+
+
+def record_nav_snapshot(snapshot: Dict) -> Optional[int]:
+    if not snapshot or snapshot.get('total_shares', 0) <= 0:
+        return None
+    conn = get_db()
+    nav_id: Optional[int] = None
+    with conn.cursor() as cur:
+        cur.execute(
+            'INSERT INTO `fund_nav_history` (`snapshot_time`, `nav`, `total_assets`, `total_shares`, `cash_amount`) '
+            'VALUES (%s, %s, %s, %s, %s)',
+            (
+                snapshot['snapshot_time'],
+                snapshot['nav'],
+                snapshot['total_assets'],
+                snapshot['total_shares'],
+                snapshot['cash_amount'],
+            ),
+        )
+        nav_id = cur.lastrowid
+        positions = snapshot.get('positions') or []
+        if positions:
+            cur.executemany(
+                'INSERT INTO `fund_position_history` (`nav_id`, `symbol`, `name`, `market_value`, `weight`) VALUES (%s, %s, %s, %s, %s)',
+                [
+                    (
+                        nav_id,
+                        pos['symbol'],
+                        pos['name'],
+                        pos['market_value'],
+                        pos['weight'],
+                    )
+                    for pos in positions
+                ],
+            )
+    return nav_id
+
+
+def ensure_recent_nav_snapshot(max_age_minutes: int = 5) -> Optional[Dict]:
+    latest = get_latest_nav_record()
+    now = dt.datetime.now(CHINA_TZ).replace(tzinfo=None)
+    if latest:
+        snap_time = latest['snapshot_time']
+        if isinstance(snap_time, dt.datetime):
+            delta = now - snap_time
+            if delta.total_seconds() <= max_age_minutes * 60:
+                return latest
+    snapshot = build_fund_snapshot()
+    if snapshot and snapshot['total_shares'] > 0:
+        nav_id = record_nav_snapshot(snapshot)
+        if nav_id:
+            set_fund_setting('fund_last_nav_id', str(nav_id))
+            return get_latest_nav_record()
+    return latest
 
 
 @app.teardown_appcontext
@@ -320,7 +568,7 @@ def register():
             flash('下次若遗失可在“我的股票”页面重置 Token。', 'success')
             # 直接登录并跳转到watchlist，方便复制
             row = db_query_one(
-                'SELECT `id`, `username`, `password_hash`, `rss_token`, `rss_token_hash`, `serverchan_send_key` FROM `users` WHERE `username` = %s',
+                'SELECT `id`, `username`, `password_hash`, `rss_token`, `rss_token_hash`, `serverchan_send_key`, `role` FROM `users` WHERE `username` = %s',
                 (username,),
             )
             user = User(
@@ -329,6 +577,7 @@ def register():
                 row['password_hash'],
                 row['rss_token'],
                 row.get('serverchan_send_key'),
+                row.get('role', 'user'),
             )
             login_user(user)
             return redirect(url_for('watchlist_view'))
@@ -344,7 +593,7 @@ def login():
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
         row = db_query_one(
-            'SELECT `id`, `username`, `password_hash`, `rss_token`, `serverchan_send_key` FROM `users` WHERE `username` = %s',
+            'SELECT `id`, `username`, `password_hash`, `rss_token`, `serverchan_send_key`, `role` FROM `users` WHERE `username` = %s',
             (username,),
         )
         if not row or not check_password_hash(row['password_hash'], password):
@@ -356,6 +605,7 @@ def login():
             row['password_hash'],
             row['rss_token'],
             row.get('serverchan_send_key'),
+            row.get('role', 'user'),
         )
         login_user(user)
         return redirect(url_for('watchlist_view'))
@@ -750,6 +1000,237 @@ def watchlist_view():
         hash_only=RSS_TOKEN_HASH_ONLY,
         serverchan_send_key=current_user.serverchan_send_key or '',
     )
+
+
+@app.route('/fund', methods=['GET'])
+@login_required
+def fund_overview_view():
+    nav_record = ensure_recent_nav_snapshot()
+    holding_row = db_query_one(
+        'SELECT `shares`, `cost_amount` FROM `fund_holdings` WHERE `user_id` = %s',
+        (current_user.id,),
+    )
+    shares = float(holding_row['shares']) if holding_row and holding_row['shares'] is not None else 0.0
+    cost_amount = float(holding_row['cost_amount']) if holding_row and holding_row['cost_amount'] is not None else 0.0
+
+    nav = float(nav_record['nav']) if nav_record and nav_record['nav'] is not None else 0.0
+    total_assets = float(nav_record['total_assets']) if nav_record and nav_record['total_assets'] is not None else 0.0
+    total_shares = float(nav_record['total_shares']) if nav_record and nav_record['total_shares'] is not None else 0.0
+    cash_amount = float(nav_record['cash_amount']) if nav_record and nav_record['cash_amount'] is not None else get_cash_balance()
+
+    current_value = shares * nav
+    profit = current_value - cost_amount
+    cost_per_share = (cost_amount / shares) if shares > 0 else None
+    share_ratio = (shares / total_shares * 100) if total_shares > 0 else None
+
+    nav_history_rows = db_query_all(
+        'SELECT `snapshot_time`, `nav`, `total_assets`, `total_shares`, `cash_amount` FROM `fund_nav_history` ORDER BY `snapshot_time` DESC LIMIT 30'
+    )
+    nav_history = [
+        {
+            'snapshot_time': row['snapshot_time'],
+            'nav': float(row['nav']) if row['nav'] is not None else 0.0,
+            'total_assets': float(row['total_assets']) if row['total_assets'] is not None else 0.0,
+            'total_shares': float(row['total_shares']) if row['total_shares'] is not None else 0.0,
+            'cash_amount': float(row['cash_amount']) if row['cash_amount'] is not None else 0.0,
+        }
+        for row in nav_history_rows
+    ]
+
+    latest_positions: List[Dict] = []
+    if nav_record:
+        rows = db_query_all(
+            'SELECT `symbol`, `name`, `market_value`, `weight` FROM `fund_position_history` WHERE `nav_id` = %s ORDER BY `weight` DESC',
+            (nav_record['id'],),
+        )
+        for row in rows:
+            latest_positions.append(
+                {
+                    'symbol': row['symbol'],
+                    'name': row['name'],
+                    'market_value': float(row['market_value']) if row['market_value'] is not None else 0.0,
+                    'weight': float(row['weight']) if row['weight'] is not None else 0.0,
+                    'weight_percent': (float(row['weight']) * 100) if row['weight'] is not None else 0.0,
+                }
+            )
+
+    return render_template(
+        'fund_overview.html',
+        nav=nav,
+        total_assets=total_assets,
+        total_shares=total_shares,
+        cash_amount=cash_amount,
+        shares=shares,
+        cost_amount=cost_amount,
+        cost_per_share=cost_per_share,
+        current_value=current_value,
+        profit=profit,
+        share_ratio=share_ratio,
+        nav_history=nav_history,
+        latest_positions=latest_positions,
+    )
+
+
+def _fetch_fund_dashboard_data() -> Dict:
+    nav_record = ensure_recent_nav_snapshot()
+    users = db_query_all('SELECT `id`, `username`, `role` FROM `users` ORDER BY `username`')
+    holdings_rows = db_query_all('SELECT `user_id`, `shares`, `cost_amount` FROM `fund_holdings`')
+    holdings_map = {row['user_id']: row for row in holdings_rows}
+    cash_balance = get_cash_balance()
+    nav_value = float(nav_record['nav']) if nav_record and nav_record['nav'] is not None else 1.0
+    nav_total_shares = float(nav_record['total_shares']) if nav_record and nav_record['total_shares'] is not None else 0.0
+    nav_total_assets = float(nav_record['total_assets']) if nav_record and nav_record['total_assets'] is not None else 0.0
+    nav_cash = float(nav_record['cash_amount']) if nav_record and nav_record['cash_amount'] is not None else cash_balance
+
+    total_cost = 0.0
+    computed_total_shares = 0.0
+    user_rows: List[Dict] = []
+    for user in users:
+        holding = holdings_map.get(user['id'])
+        shares = float(holding['shares']) if holding and holding['shares'] is not None else 0.0
+        cost_amount = float(holding['cost_amount']) if holding and holding['cost_amount'] is not None else 0.0
+        current_value = shares * nav_value
+        profit = current_value - cost_amount
+        total_cost += cost_amount
+        computed_total_shares += shares
+        user_rows.append(
+            {
+                'id': user['id'],
+                'username': user['username'],
+                'role': user['role'],
+                'shares': shares,
+                'cost_amount': cost_amount,
+                'current_value': current_value,
+                'profit': profit,
+            }
+        )
+
+    total_shares = nav_total_shares if nav_total_shares > 0 else computed_total_shares
+    total_assets = nav_total_assets if nav_total_assets > 0 else (nav_value * total_shares + cash_balance)
+    total_value = nav_value * total_shares
+    total_profit = total_value - total_cost
+    initialized_at = get_fund_setting('fund_initialized_at')
+    initialized_by = get_fund_setting('fund_initialized_by')
+
+    cash_logs = db_query_all(
+        'SELECT `id`, `amount`, `note`, `created_at` FROM `fund_cash_adjustments` ORDER BY `created_at` DESC LIMIT 20'
+    )
+
+    return {
+        'users': user_rows,
+        'nav_record': nav_record,
+        'nav': nav_value,
+        'cash_balance': cash_balance,
+        'nav_cash': nav_cash,
+        'total_shares': total_shares,
+        'total_assets': total_assets,
+        'total_value': total_value,
+        'total_cost': total_cost,
+        'total_profit': total_profit,
+        'initialized_at': initialized_at,
+        'initialized_by': initialized_by,
+        'cash_logs': cash_logs,
+    }
+
+
+@app.route('/manager/fund')
+@login_required
+@manager_required
+def fund_manager_dashboard():
+    data = _fetch_fund_dashboard_data()
+    return render_template('fund_admin.html', **data)
+
+
+@app.route('/manager/fund/holdings', methods=['POST'])
+@login_required
+@manager_required
+def fund_manager_update_holding():
+    user_id_raw = request.form.get('user_id', '').strip()
+    shares_raw = request.form.get('shares', '').strip()
+    cost_raw = request.form.get('cost_amount', '').strip()
+    try:
+        user_id = int(user_id_raw)
+    except (TypeError, ValueError):
+        flash('无效的用户ID', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    user_row = db_query_one('SELECT `id`, `username` FROM `users` WHERE `id` = %s', (user_id,))
+    if not user_row:
+        flash('用户不存在', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    username = user_row['username']
+    try:
+        shares = float(shares_raw)
+        cost_amount = float(cost_raw)
+    except (TypeError, ValueError):
+        flash('请输入有效的份额和成本金额', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    if shares <= 0:
+        db_execute('DELETE FROM `fund_holdings` WHERE `user_id` = %s', (user_id,))
+        flash(f'已清除 {username} 的基金份额记录。', 'success')
+    else:
+        db_execute(
+            'INSERT INTO `fund_holdings` (`user_id`, `shares`, `cost_amount`) VALUES (%s, %s, %s) '
+            'ON DUPLICATE KEY UPDATE `shares` = VALUES(`shares`), `cost_amount` = VALUES(`cost_amount`)',
+            (user_id, shares, cost_amount),
+        )
+        flash(f'已更新 {username} 的基金份额。', 'success')
+    return redirect(url_for('fund_manager_dashboard'))
+
+
+@app.route('/manager/fund/cash', methods=['POST'])
+@login_required
+@manager_required
+def fund_manager_adjust_cash():
+    amount_raw = request.form.get('amount', '').strip()
+    note = request.form.get('note', '').strip() or None
+    try:
+        amount = float(amount_raw)
+    except (TypeError, ValueError):
+        flash('请输入有效的现金金额', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+    if amount == 0:
+        flash('金额不能为0', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+    db_execute(
+        'INSERT INTO `fund_cash_adjustments` (`amount`, `note`, `operator_id`) VALUES (%s, %s, %s)',
+        (amount, note, current_user.id),
+    )
+    flash('现金调整已记录。', 'success')
+    return redirect(url_for('fund_manager_dashboard'))
+
+
+@app.route('/manager/fund/init', methods=['POST'])
+@login_required
+@manager_required
+def fund_manager_initialize():
+    token = (request.form.get('auth_token') or '').strip()
+    if token != 'weijie81':
+        flash('初始化口令不正确，操作已取消。', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    snapshot = build_fund_snapshot()
+    if not snapshot:
+        flash('无法生成基金仓位快照，请确认 cwjcw 用户及持仓数据已配置。', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+    if snapshot['total_shares'] <= 0:
+        flash('基金份额总量为0，请先录入各用户份额。', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    nav_id = record_nav_snapshot(snapshot)
+    if not nav_id:
+        flash('保存基金快照失败，请稍后重试。', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    now = snapshot['snapshot_time']
+    set_fund_setting('fund_initialized_at', now.isoformat())
+    set_fund_setting('fund_initialized_by', str(current_user.id))
+    set_fund_setting('fund_initial_nav_id', str(nav_id))
+    set_fund_setting('fund_initial_nav_value', f"{snapshot['nav']:.6f}")
+    flash('基金已完成初始化基准，已记录当前仓位与净值。', 'success')
+    return redirect(url_for('fund_manager_dashboard'))
 
 
 @app.route('/trades', methods=['GET', 'POST'])

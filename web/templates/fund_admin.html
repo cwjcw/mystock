@@ -1,0 +1,224 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>基金管理后台</h2>
+<section class="card-grid">
+  <div class="card">
+    <h3>最新净值</h3>
+    <p class="figure">{{ '%.4f'|format(nav) }}</p>
+    {% if nav_record %}
+      <small>更新时间：{{ nav_record.snapshot_time }}</small>
+    {% else %}
+      <small>尚未生成净值记录</small>
+    {% endif %}
+  </div>
+  <div class="card">
+    <h3>基金份额总量</h3>
+    <p class="figure">{{ '%.2f'|format(total_shares) }}</p>
+    <small>当前内含现金：{{ '%.2f'|format(nav_cash) }}</small>
+  </div>
+  <div class="card">
+    <h3>现金余额</h3>
+    <p class="figure">{{ '%.2f'|format(cash_balance) }}</p>
+    <small>总资产估值：{{ '%.2f'|format(total_assets) }}</small>
+  </div>
+  <div class="card">
+    <h3>累计盈亏</h3>
+    <p class="figure">{{ '%.2f'|format(total_profit) }}</p>
+    <small>累计成本：{{ '%.2f'|format(total_cost) }}</small>
+  </div>
+</section>
+
+<section class="panel">
+  <h3>初始化基准</h3>
+  <p>基金初始化用于锁定当日仓位与净值基准，请确保已完成仓位整理后操作。</p>
+  {% if initialized_at %}
+    <p class="status">已于 {{ initialized_at }} 初始化{% if initialized_by %}（操作人ID {{ initialized_by }}）{% endif %}</p>
+  {% else %}
+    <p class="status warning">尚未初始化。</p>
+  {% endif %}
+  <form id="fund-init-form" method="post" action="{{ url_for('fund_manager_initialize') }}" class="init-form">
+    <div id="fund-init-confirm" class="init-confirm hidden">
+      <label for="fund-init-token">请输入口令确认操作</label>
+      <input type="password" name="auth_token" id="fund-init-token" placeholder="请输入口令" required>
+      <div class="init-actions">
+        <button type="submit" class="btn danger">确认初始化</button>
+        <button type="button" class="btn" id="fund-init-cancel">取消</button>
+      </div>
+    </div>
+  </form>
+  <button type="button" class="btn danger" id="fund-init-button">初始化基金</button>
+</section>
+
+<section class="panel">
+  <h3>用户份额管理</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>用户</th>
+        <th>份额</th>
+        <th>成本</th>
+        <th>当前市值</th>
+        <th>盈亏</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for user in users %}
+      <tr class="{% if user.role == 'manager' %}muted{% endif %}">
+        <td>
+          {{ user.username }}
+          {% if user.role == 'manager' %}<small>(管理员)</small>{% endif %}
+        </td>
+        <td>{{ '%.2f'|format(user.shares) }}</td>
+        <td>{{ '%.2f'|format(user.cost_amount) }}</td>
+        <td>{{ '%.2f'|format(user.current_value) }}</td>
+        <td>{{ '%.2f'|format(user.profit) }}</td>
+        <td>
+          <form method="post" action="{{ url_for('fund_manager_update_holding') }}" class="inline-form">
+            <input type="hidden" name="user_id" value="{{ user.id }}">
+            <input type="number" step="0.01" name="shares" value="{{ '%.2f'|format(user.shares) }}" placeholder="份额">
+            <input type="number" step="0.01" name="cost_amount" value="{{ '%.2f'|format(user.cost_amount) }}" placeholder="成本">
+            <button class="btn small" type="submit">保存</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">注：份额为基金单位数，成本为总投入金额。份额填0可清除记录。</p>
+</section>
+
+<section class="panel">
+  <h3>现金调整</h3>
+  <form method="post" action="{{ url_for('fund_manager_adjust_cash') }}" class="inline-form">
+    <input type="number" step="0.01" name="amount" placeholder="金额" required>
+    <input type="text" name="note" placeholder="备注（可选）">
+    <button class="btn" type="submit">记录现金变动</button>
+  </form>
+  <small>正值表示注入资金，负值表示赎回或支出。</small>
+  <table class="data-table compact">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>金额</th>
+        <th>备注</th>
+        <th>时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for log in cash_logs %}
+      <tr>
+        <td>{{ log.id }}</td>
+        <td>{{ '%.2f'|format(log.amount) }}</td>
+        <td>{{ log.note or '-' }}</td>
+        <td>{{ log.created_at }}</td>
+      </tr>
+      {% endfor %}
+      {% if not cash_logs %}
+      <tr><td colspan="4" class="muted">暂无记录</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+(function() {
+  const trigger = document.getElementById('fund-init-button');
+  const confirmBox = document.getElementById('fund-init-confirm');
+  const cancelBtn = document.getElementById('fund-init-cancel');
+  const tokenInput = document.getElementById('fund-init-token');
+  if (!trigger || !confirmBox || !cancelBtn || !tokenInput) {
+    return;
+  }
+  trigger.addEventListener('click', () => {
+    confirmBox.classList.remove('hidden');
+    trigger.classList.add('hidden');
+    tokenInput.focus();
+  });
+  cancelBtn.addEventListener('click', () => {
+    tokenInput.value = '';
+    confirmBox.classList.add('hidden');
+    trigger.classList.remove('hidden');
+  });
+})();
+</script>
+<style>
+.card-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.card {
+  background: #1f2937;
+  padding: 1rem;
+  border-radius: 8px;
+}
+.card .figure {
+  font-size: 1.8rem;
+  margin: 0.2rem 0;
+}
+.panel {
+  background: #111827;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-top: 1.5rem;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 1rem;
+}
+.data-table th,
+.data-table td {
+  border-bottom: 1px solid #374151;
+  padding: 0.5rem;
+}
+.data-table .muted {
+  color: #9ca3af;
+}
+.data-table.compact td,
+.data-table.compact th {
+  font-size: 0.9rem;
+}
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.inline-form input[type="number"],
+.inline-form input[type="text"] {
+  padding: 0.3rem 0.5rem;
+  background: #0f172a;
+  border: 1px solid #374151;
+  color: #f9fafb;
+  border-radius: 4px;
+}
+.btn.small {
+  padding: 0.3rem 0.6rem;
+}
+.btn.danger {
+  background: #b91c1c;
+}
+.init-form { margin-top: 0.75rem; }
+.init-confirm { background: #0f172a; padding: 0.75rem; border-radius: 6px; border: 1px solid #1f2937; }
+.init-confirm label { display:block; margin-bottom:0.5rem; font-size:0.85rem; }
+.init-confirm input { width:100%; padding:0.45rem 0.6rem; border:1px solid #374151; border-radius:4px; background:#020617; color:#f9fafb; }
+.init-actions { display:flex; gap:0.75rem; margin-top:0.75rem; }
+.hidden { display:none !important; }
+.status {
+  margin: 0.5rem 0;
+}
+.status.warning {
+  color: #f59e0b;
+}
+.hint {
+  color: #9ca3af;
+  margin-top: 0.5rem;
+}
+</style>
+{% endblock %}

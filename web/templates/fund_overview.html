@@ -1,0 +1,144 @@
+{% extends 'layout.html' %}
+{% block content %}
+<h2>我的基金</h2>
+{% if shares <= 0 %}
+  <p class="empty">当前尚未分配基金份额，请联系基金经理。</p>
+{% endif %}
+<section class="panel">
+  <h3>份额信息</h3>
+  <table class="data-table">
+    <tbody>
+      <tr>
+        <th>持有份额</th>
+        <td>{{ '%.2f'|format(shares) }}</td>
+      </tr>
+      <tr>
+        <th>投入成本</th>
+        <td>{{ '%.2f'|format(cost_amount) }}</td>
+      </tr>
+      <tr>
+        <th>单位成本</th>
+        <td>{% if cost_per_share is not none %}{{ '%.4f'|format(cost_per_share) }}{% else %}-{% endif %}</td>
+      </tr>
+      <tr>
+        <th>当前净值</th>
+        <td>{{ '%.4f'|format(nav) }}</td>
+      </tr>
+      <tr>
+        <th>市值估算</th>
+        <td>{{ '%.2f'|format(current_value) }}</td>
+      </tr>
+      <tr>
+        <th>累计盈亏</th>
+        <td class="{% if profit >= 0 %}gain{% else %}loss{% endif %}">{{ '%.2f'|format(profit) }}</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="note">单位成本 = 个人总投入金额 ÷ 当前持有份额，用于衡量每份基金的平均买入成本。</p>
+</section>
+
+<section class="panel">
+  <h3>最新仓位</h3>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>标的</th>
+        <th>名称</th>
+        <th>市值</th>
+        <th>仓位占比</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for pos in latest_positions %}
+      <tr>
+        <td>{{ pos.symbol }}</td>
+        <td>{{ pos.name }}</td>
+        <td>{{ '%.2f'|format(pos.market_value) }}</td>
+        <td>{{ '%.2f'|format(pos.weight_percent) }}%</td>
+      </tr>
+      {% endfor %}
+      {% if not latest_positions %}
+      <tr><td colspan="4" class="muted">暂无仓位数据</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h3>净值历史（最近30条）</h3>
+  <table class="data-table compact">
+    <thead>
+      <tr>
+        <th>时间</th>
+        <th>净值</th>
+        <th>总资产</th>
+        <th>份额总量</th>
+        <th>现金</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in nav_history %}
+      <tr>
+        <td>{{ row.snapshot_time }}</td>
+        <td>{{ '%.4f'|format(row.nav) }}</td>
+        <td>{{ '%.2f'|format(row.total_assets) }}</td>
+        <td>{{ '%.2f'|format(row.total_shares) }}</td>
+        <td>{{ '%.2f'|format(row.cash_amount) }}</td>
+      </tr>
+      {% endfor %}
+      {% if not nav_history %}
+      <tr><td colspan="5" class="muted">暂无净值记录</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<style>
+.panel {
+  background: #111827;
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.data-table th,
+.data-table td {
+  border-bottom: 1px solid #1f2937;
+  padding: 0.5rem 0.6rem;
+}
+.data-table thead th {
+  text-align: left;
+}
+.data-table .muted {
+  text-align: center;
+  color: #9ca3af;
+}
+.data-table.compact td,
+.data-table.compact th {
+  font-size: 0.85rem;
+}
+.empty {
+  padding: 0.8rem 1rem;
+  border-radius: 6px;
+  background: #1f2937;
+  margin-bottom: 1rem;
+}
+.gain {
+  color: #10b981;
+}
+.loss {
+  color: #ef4444;
+}
+.note {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+  color: #9ca3af;
+}
+</style>
+{% endblock %}
