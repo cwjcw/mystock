@@ -1503,6 +1503,10 @@ def daily_profits_view():
     if total_market_value and abs(total_market_value) > 1e-9:
         average_ratio = (total_amount / total_market_value) * 100
 
+    average_daily_amount = None
+    if amount_values:
+        average_daily_amount = total_amount / len(amount_values)
+
     return render_template(
         'daily_profits.html',
         records=records,
@@ -1511,6 +1515,7 @@ def daily_profits_view():
         ratios=chart_ratios,
         total_amount=total_amount,
         average_ratio=average_ratio,
+        average_daily_amount=average_daily_amount,
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
     )

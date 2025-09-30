@@ -15,15 +15,16 @@
   <ul class="profit-list">
     <li class="profit-item">
       <div class="profit-line">
-        <span class="profit-label">区间天数</span>
-        <span class="profit-value">{{ records|length }} 天</span>
+        <span class="profit-label">盈亏合计</span>
+        {% set total_class = 'profit-positive' if total_amount > 0 else 'profit-negative' if total_amount < 0 else '' %}
+        <span class="profit-value profit-sm {{ total_class }}">{{ '{:,.0f}'.format(total_amount) if total_amount is not none else '-' }} 元</span>
       </div>
     </li>
     <li class="profit-item">
       <div class="profit-line">
-        <span class="profit-label">盈亏合计</span>
-        {% set total_class = 'profit-positive' if total_amount > 0 else 'profit-negative' if total_amount < 0 else '' %}
-        <span class="profit-value profit-sm {{ total_class }}">{{ '{:,.0f}'.format(total_amount) if total_amount is not none else '-' }} 元</span>
+        <span class="profit-label">平均每天盈亏</span>
+        {% set avg_amount_class = 'profit-positive' if average_daily_amount and average_daily_amount > 0 else 'profit-negative' if average_daily_amount and average_daily_amount < 0 else '' %}
+        <span class="profit-value profit-sm {{ avg_amount_class }}">{{ '-' if average_daily_amount is none else '{:,.0f}'.format(average_daily_amount) }} 元</span>
       </div>
     </li>
     <li class="profit-item">
