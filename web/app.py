@@ -4,10 +4,11 @@ import hashlib
 import time
 import threading
 import math
+import logging
 from functools import wraps
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 from flask import Flask, g, render_template, request, redirect, url_for, flash, make_response, abort
 from flask_login import (
@@ -43,6 +44,7 @@ from html import escape
 
 
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+logger = logging.getLogger(__name__)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -86,6 +88,10 @@ RATE_LIMIT_WINDOW = int(os.environ.get('RSS_RATE_WINDOW', '60'))   # seconds
 _RL_LOCK = threading.Lock()
 _RL_BUCKETS: dict[str, deque] = defaultdict(deque)
 
+_TRADING_CAL_CACHE: Optional[Set[str]] = None
+_TRADING_CAL_LAST_FETCH: Optional[float] = None
+_TRADING_CAL_TTL_SECONDS = 6 * 3600  # refresh trading calendar every 6 hours by default
+
 
 def _rate_check_and_consume(key: str):
     """Return (ok: bool, retry_after: int)."""
@@ -100,6 +106,38 @@ def _rate_check_and_consume(key: str):
             return False, max(retry, 1)
         q.append(now)
         return True, 0
+
+
+def _ensure_trading_calendar() -> bool:
+    """Refresh trading calendar cache when necessary."""
+    global _TRADING_CAL_CACHE, _TRADING_CAL_LAST_FETCH
+    now_ts = time.time()
+    if (
+        _TRADING_CAL_CACHE is not None
+        and _TRADING_CAL_LAST_FETCH is not None
+        and (now_ts - _TRADING_CAL_LAST_FETCH) < _TRADING_CAL_TTL_SECONDS
+    ):
+        return True
+    try:
+        import akshare as ak  # type: ignore
+
+        df = ak.tool_trade_date_hist_sina()
+    except Exception as exc:  # pragma: no cover - network/cache failure path
+        logger.warning("无法刷新交易日历，默认继续视为交易日: %s", exc)
+        return False
+    _TRADING_CAL_CACHE = set(df["trade_date"].astype(str))
+    _TRADING_CAL_LAST_FETCH = now_ts
+    return True
+
+
+def _is_trading_day(date_obj: dt.date) -> bool:
+    """Return True if the given date is a trading day on mainland stock exchanges."""
+    if date_obj.weekday() >= 5:
+        return False
+    date_str = date_obj.strftime("%Y-%m-%d")
+    if not _ensure_trading_calendar():
+        return True
+    return date_str in (_TRADING_CAL_CACHE or set())
 
 
 def get_db():
@@ -598,7 +636,7 @@ def login():
         )
         if not row or not check_password_hash(row['password_hash'], password):
             flash('用户名或密码错误', 'error')
-            return render_template('login.html')
+            return render_template('login.html', username=username)
         user = User(
             row['id'],
             row['username'],
@@ -906,6 +944,9 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
 
 def _record_daily_snapshot(user_id: int, snapshot: Optional[dict] = None, snapshot_date: Optional[dt.date] = None) -> bool:
     target_date = snapshot_date or dt.datetime.now(CHINA_TZ).date()
+    if not _is_trading_day(target_date):
+        logger.debug("跳过 %s 的每日盈亏记录（非交易日）", target_date)
+        return False
     data = snapshot
     if data is None:
         data = _get_portfolio_context(user_id, target_date.replace(month=1, day=1), target_date)
@@ -928,6 +969,9 @@ def _record_daily_snapshot(user_id: int, snapshot: Optional[dict] = None, snapsh
 
 def _record_daily_snapshots_for_all_users(snapshot_date: Optional[dt.date] = None) -> None:
     target_date = snapshot_date or dt.datetime.now(CHINA_TZ).date()
+    if not _is_trading_day(target_date):
+        logger.info("检测到 %s 为非交易日，跳过每日盈亏写入。", target_date)
+        return
     users = db_query_all('SELECT `id` FROM `users`')
     for row in users:
         try:
