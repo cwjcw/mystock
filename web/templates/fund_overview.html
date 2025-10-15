@@ -69,25 +69,27 @@
   <table class="data-table compact">
     <thead>
       <tr>
-        <th>时间</th>
+        <th>日期</th>
         <th>净值</th>
-        <th>总资产</th>
-        <th>份额总量</th>
-        <th>现金</th>
+        <th>持有份额</th>
+        <th>资产估值</th>
+        <th>投入成本</th>
+        <th>盈亏</th>
       </tr>
     </thead>
     <tbody>
       {% for row in nav_history %}
       <tr>
-        <td>{{ row.snapshot_time }}</td>
+        <td>{{ row.snapshot_date }}</td>
         <td>{{ '%.4f'|format(row.nav) }}</td>
-        <td>{{ '%.2f'|format(row.total_assets) }}</td>
-        <td>{{ '%.2f'|format(row.total_shares) }}</td>
-        <td>{{ '%.2f'|format(row.cash_amount) }}</td>
+        <td>{{ '%.2f'|format(row.shares) }}</td>
+        <td>{{ '%.2f'|format(row.value) }}</td>
+        <td>{{ '%.2f'|format(row.cost_amount) }}</td>
+        <td class="{% if row.profit >= 0 %}gain{% else %}loss{% endif %}">{{ '%.2f'|format(row.profit) }}</td>
       </tr>
       {% endfor %}
       {% if not nav_history %}
-      <tr><td colspan="5" class="muted">暂无净值记录</td></tr>
+      <tr><td colspan="6" class="muted">暂无净值记录</td></tr>
       {% endif %}
     </tbody>
   </table>

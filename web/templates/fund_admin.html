@@ -29,6 +29,13 @@
 </section>
 
 <section class="panel">
+  <h3>自动结算状态</h3>
+  <p>最近结算日期：{{ last_settlement_date or '尚未执行' }}</p>
+  <p>待处理订单数：{{ pending_orders|length }}</p>
+  <small>系统会在交易日收盘后自动结算并通过 Server酱通知结果。</small>
+</section>
+
+<section class="panel">
   <h3>初始化基准</h3>
   <p>基金初始化用于锁定当日仓位与净值基准，请确保已完成仓位整理后操作。</p>
   {% if initialized_at %}
@@ -74,18 +81,149 @@
         <td>{{ '%.2f'|format(user.current_value) }}</td>
         <td>{{ '%.2f'|format(user.profit) }}</td>
         <td>
-          <form method="post" action="{{ url_for('fund_manager_update_holding') }}" class="inline-form">
+          <form method="post" action="{{ url_for('fund_manager_create_order') }}" class="inline-form">
             <input type="hidden" name="user_id" value="{{ user.id }}">
-            <input type="number" step="0.01" name="shares" value="{{ '%.2f'|format(user.shares) }}" placeholder="份额">
-            <input type="number" step="0.01" name="cost_amount" value="{{ '%.2f'|format(user.cost_amount) }}" placeholder="成本">
-            <button class="btn small" type="submit">保存</button>
+            <select name="direction">
+              <option value="subscribe">申购</option>
+              <option value="redeem">赎回</option>
+            </select>
+            <input type="number" step="0.01" name="amount" placeholder="金额" required>
+            <input type="text" name="note" placeholder="备注（可选）">
+            <button class="btn small" type="submit">提交</button>
           </form>
+          <small class="form-hint">提交后系统将在收盘后按当日净值自动结算。</small>
         </td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
   <p class="hint">注：份额为基金单位数，成本为总投入金额。份额填0可清除记录。</p>
+</section>
+
+<section class="panel danger">
+  <h3>基金数据重置</h3>
+  <p class="warning">该操作会清空基金份额、净值、订单与现金记录，请谨慎使用。</p>
+  <form method="post" action="{{ url_for('fund_manager_reset') }}" class="inline-form">
+    {% if reset_token_required %}
+    <input type="password" name="reset_token" placeholder="请输入重置口令" required>
+    {% else %}
+    <input type="password" name="reset_token" placeholder="若已设置 FUND_RESET_TOKEN，请输入口令">
+    {% endif %}
+    <button class="btn danger" type="submit">立即重置</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h3>待处理订单</h3>
+  <table class="data-table compact">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>用户</th>
+        <th>方向</th>
+        <th>金额</th>
+        <th>备注</th>
+        <th>提交时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for order in pending_orders %}
+      <tr>
+        <td>{{ order.id }}</td>
+        <td>{{ order.user_name or ('用户' ~ order.user_id) }}</td>
+        <td>{{ '申购' if order.direction == 'subscribe' else '赎回' }}</td>
+        <td>{{ '%.2f'|format(order.request_amount) }}</td>
+        <td>{{ order.note or '-' }}</td>
+        <td>{{ order.created_at }}</td>
+      </tr>
+      {% endfor %}
+      {% if not pending_orders %}
+      <tr><td colspan="6" class="muted">当前没有待处理订单。</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h3>最近结算订单</h3>
+  <table class="data-table compact">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>用户</th>
+        <th>方向</th>
+        <th>请求金额</th>
+        <th>实际金额</th>
+        <th>净值</th>
+        <th>份额变化</th>
+        <th>状态</th>
+        <th>备注</th>
+        <th>时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for order in recent_orders %}
+      <tr>
+        <td>{{ order.id }}</td>
+        <td>{{ order.user_name or ('用户' ~ order.user_id) }}</td>
+        <td>{{ '申购' if order.direction == 'subscribe' else '赎回' }}</td>
+        <td>{{ '%.2f'|format(order.request_amount) }}</td>
+        <td>{{ order.settled_amount is not none and '%.2f'|format(order.settled_amount) or '-' }}</td>
+        <td>{{ order.nav_used is not none and '%.4f'|format(order.nav_used) or '-' }}</td>
+        <td>{{ order.shares_delta is not none and '%.2f'|format(order.shares_delta) or '-' }}</td>
+        <td>
+          {% if order.status == 'processed' %}
+            已完成
+          {% elif order.status == 'partial' %}
+            部分完成
+          {% elif order.status == 'failed' %}
+            失败
+          {% else %}
+            {{ order.status }}
+          {% endif %}
+        </td>
+        <td>{{ order.failure_reason or order.note or '-' }}</td>
+        <td>{{ order.processed_at or '-' }}</td>
+      </tr>
+      {% endfor %}
+      {% if not recent_orders %}
+      <tr><td colspan="10" class="muted">暂无结算记录</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h3>份额调整记录</h3>
+  <table class="data-table compact">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>用户</th>
+        <th>份额变化</th>
+        <th>成本变化</th>
+        <th>备注</th>
+        <th>操作人</th>
+        <th>时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for log in share_logs %}
+      <tr>
+        <td>{{ log.id }}</td>
+        <td>{{ log.user_name or '未知用户' }}</td>
+        <td>{{ '%.2f'|format(log.delta_shares) }}</td>
+        <td>{{ '%.2f'|format(log.delta_cost_amount) }}</td>
+        <td>{{ log.note or '-' }}</td>
+        <td>{{ log.operator_name or '-' }}</td>
+        <td>{{ log.created_at }}</td>
+      </tr>
+      {% endfor %}
+      {% if not share_logs %}
+      <tr><td colspan="7" class="muted">暂无调整记录</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
 </section>
 
 <section class="panel">
@@ -191,18 +329,38 @@
   align-items: center;
 }
 .inline-form input[type="number"],
-.inline-form input[type="text"] {
+.inline-form input[type="text"],
+.inline-form select {
   padding: 0.3rem 0.5rem;
   background: #0f172a;
   border: 1px solid #374151;
   color: #f9fafb;
   border-radius: 4px;
 }
+.inline-form select {
+  min-width: 90px;
+}
+.inline-form + .inline-form {
+  margin-top: 0.5rem;
+}
+.form-hint {
+  display: block;
+  margin-top: 0.3rem;
+  color: #9ca3af;
+  font-size: 0.8rem;
+}
 .btn.small {
   padding: 0.3rem 0.6rem;
 }
 .btn.danger {
   background: #b91c1c;
+}
+.panel.danger {
+  border: 1px solid #7f1d1d;
+  background: #1b0f12;
+}
+.panel .warning {
+  color: #f87171;
 }
 .init-form { margin-top: 0.75rem; }
 .init-confirm { background: #0f172a; padding: 0.75rem; border-radius: 6px; border: 1px solid #1f2937; }

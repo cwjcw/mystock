@@ -41,6 +41,7 @@ import asyncio
 import aiohttp
 import datetime as dt
 from html import escape
+import requests
 
 
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
@@ -294,6 +295,27 @@ def init_db():
 
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS `fund_user_nav_history` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `snapshot_date` DATE NOT NULL,
+                    `nav_id` INT,
+                    `nav` DOUBLE NOT NULL,
+                    `shares` DOUBLE NOT NULL,
+                    `value` DOUBLE NOT NULL,
+                    `cost_amount` DOUBLE NOT NULL,
+                    `profit` DOUBLE NOT NULL,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uniq_user_date` (`user_id`, `snapshot_date`),
+                    CONSTRAINT `fk_user_nav_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE,
+                    CONSTRAINT `fk_user_nav_nav` FOREIGN KEY (`nav_id`) REFERENCES `fund_nav_history`(`id`) ON DELETE SET NULL
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS `fund_position_history` (
                     `id` INT AUTO_INCREMENT PRIMARY KEY,
                     `nav_id` INT NOT NULL,
@@ -321,6 +343,49 @@ def init_db():
 
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS `fund_share_adjustments` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `delta_shares` DOUBLE NOT NULL,
+                    `delta_cost_amount` DOUBLE NOT NULL,
+                    `note` VARCHAR(255),
+                    `operator_id` INT,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT `fk_adjust_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE,
+                    CONSTRAINT `fk_adjust_operator` FOREIGN KEY (`operator_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+                    INDEX `idx_adjust_created_at` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_orders` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `direction` VARCHAR(16) NOT NULL,
+                    `request_amount` DOUBLE NOT NULL,
+                    `settled_amount` DOUBLE,
+                    `nav_used` DOUBLE,
+                    `shares_delta` DOUBLE,
+                    `cost_delta` DOUBLE,
+                    `status` VARCHAR(16) NOT NULL DEFAULT 'pending',
+                    `failure_reason` VARCHAR(255),
+                    `note` VARCHAR(255),
+                    `operator_id` INT,
+                    `trade_date` DATE,
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    `processed_at` DATETIME,
+                    CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE,
+                    CONSTRAINT `fk_orders_operator` FOREIGN KEY (`operator_id`) REFERENCES `users`(`id`) ON DELETE SET NULL,
+                    INDEX `idx_orders_status` (`status`),
+                    INDEX `idx_orders_trade_date` (`trade_date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS `fund_settings` (
                     `key` VARCHAR(64) PRIMARY KEY,
                     `value` TEXT,
@@ -334,7 +399,7 @@ def init_db():
             cur.execute('SELECT `id` FROM `users` WHERE `username` = %s', ('manager',))
             exists = cur.fetchone()
             if not exists:
-                password = generate_password_hash('weijie81')
+                password = generate_password_hash('123456')
                 cur.execute(
                     'INSERT INTO `users` (`username`, `password_hash`, `role`) VALUES (%s, %s, %s)',
                     ('manager', password, 'manager'),
@@ -348,6 +413,17 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
+
+_FUND_SETTLEMENT_THREAD_STARTED = False
+
+
+def _start_fund_settlement_thread():
+    global _FUND_SETTLEMENT_THREAD_STARTED
+    if _FUND_SETTLEMENT_THREAD_STARTED:
+        return
+    thread = threading.Thread(target=_fund_settlement_worker, args=(app,), daemon=True)
+    thread.start()
+    _FUND_SETTLEMENT_THREAD_STARTED = True
 
 
 class User(UserMixin):
@@ -449,6 +525,497 @@ def get_user_id_by_username(username: str) -> Optional[int]:
     return None
 
 
+def reset_fund_data() -> None:
+    """清空基金相关表，用于系统重置。"""
+    tables = [
+        'fund_orders',
+        'fund_share_adjustments',
+        'fund_cash_adjustments',
+        'fund_position_history',
+        'fund_user_nav_history',
+        'fund_nav_history',
+        'fund_holdings',
+    ]
+    for table in tables:
+        db_execute(f'DELETE FROM `{table}`')
+
+    for key in (
+        'fund_last_nav_id',
+        'fund_last_nav_value',
+        'fund_initialized_at',
+        'fund_initialized_by',
+        'fund_initial_nav_id',
+        'fund_initial_nav_value',
+        'fund_last_settlement_date',
+    ):
+        db_execute('DELETE FROM `fund_settings` WHERE `key` = %s', (key,))
+
+
+def _default_nav_value() -> float:
+    raw = os.environ.get('FUND_DEFAULT_NAV', '1.0')
+    try:
+        nav = float(raw)
+        return nav if nav > 0 else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def get_nav_for_settlement() -> float:
+    """获取用于当日结算的净值，优先使用最新快照，否则回退到设置或默认值。"""
+    nav_record = ensure_recent_nav_snapshot()
+    if nav_record and nav_record.get('nav'):
+        try:
+            nav_value = float(nav_record['nav'])
+        except (TypeError, ValueError):
+            nav_value = 0.0
+        if nav_value > 0:
+            set_fund_setting('fund_last_nav_value', f"{nav_value:.6f}")
+            return nav_value
+
+    last_nav = get_fund_setting('fund_last_nav_value')
+    if last_nav:
+        try:
+            nav_value = float(last_nav)
+            if nav_value > 0:
+                return nav_value
+        except (TypeError, ValueError):
+            pass
+    return _default_nav_value()
+
+
+def _fetch_holding(user_id: int) -> Dict:
+    row = db_query_one(
+        'SELECT `shares`, `cost_amount` FROM `fund_holdings` WHERE `user_id` = %s',
+        (user_id,),
+    )
+    if not row:
+        return {'shares': 0.0, 'cost_amount': 0.0}
+    return {
+        'shares': float(row.get('shares') or 0.0),
+        'cost_amount': float(row.get('cost_amount') or 0.0),
+    }
+
+
+def adjust_fund_holding(user_id: int, delta_shares: float, delta_cost: float) -> Dict:
+    """调整指定用户的基金份额及成本，返回调整后的数据。"""
+    holding = _fetch_holding(user_id)
+    new_shares = holding['shares'] + delta_shares
+    new_cost = holding['cost_amount'] + delta_cost
+    eps = 1e-9
+
+    if new_shares <= eps:
+        db_execute('DELETE FROM `fund_holdings` WHERE `user_id` = %s', (user_id,))
+        return {'shares': 0.0, 'cost_amount': 0.0}
+
+    if new_cost < 0 and abs(new_cost) < 0.01:
+        new_cost = 0.0
+    if new_cost < 0:
+        raise ValueError('调整后成本为负数')
+
+    if holding['shares'] <= eps:
+        db_execute(
+            'INSERT INTO `fund_holdings` (`user_id`, `shares`, `cost_amount`) VALUES (%s, %s, %s)',
+            (user_id, new_shares, new_cost),
+        )
+    else:
+        db_execute(
+            'UPDATE `fund_holdings` SET `shares` = %s, `cost_amount` = %s WHERE `user_id` = %s',
+            (new_shares, new_cost, user_id),
+        )
+    return {'shares': new_shares, 'cost_amount': new_cost}
+
+
+def insert_share_adjustment(
+    user_id: int,
+    delta_shares: float,
+    delta_cost: float,
+    note: Optional[str],
+    operator_id: Optional[int],
+) -> None:
+    if abs(delta_shares) < 1e-9 and abs(delta_cost) < 0.01:
+        return
+    db_execute(
+        'INSERT INTO `fund_share_adjustments` (`user_id`, `delta_shares`, `delta_cost_amount`, `note`, `operator_id`) '
+        'VALUES (%s, %s, %s, %s, %s)',
+        (user_id, delta_shares, delta_cost, note, operator_id),
+    )
+
+
+def create_fund_order(
+    user_id: int,
+    direction: str,
+    amount: float,
+    note: Optional[str],
+    operator_id: Optional[int],
+) -> int:
+    if amount <= 0:
+        raise ValueError('金额必须大于0')
+    if direction not in {'subscribe', 'redeem'}:
+        raise ValueError('无效的订单类型')
+    conn = get_db()
+    today = dt.date.today()
+    with conn.cursor() as cur:
+        cur.execute(
+            'INSERT INTO `fund_orders` (`user_id`, `direction`, `request_amount`, `note`, `operator_id`, `trade_date`) '
+            'VALUES (%s, %s, %s, %s, %s, %s)',
+            (user_id, direction, amount, note, operator_id, today),
+        )
+        order_id = cur.lastrowid
+    return int(order_id)
+
+
+def _calculate_redemption_cost_delta(holding: Dict, shares_to_redeem: float) -> float:
+    current_shares = holding['shares']
+    if current_shares <= 0:
+        return 0.0
+    cost_amount = holding['cost_amount']
+    ratio = min(abs(shares_to_redeem) / current_shares, 1.0)
+    return -cost_amount * ratio
+
+
+def process_pending_fund_orders(nav_value: float, trade_date: dt.date) -> Dict:
+    """处理所有待结算订单，返回结算概要。"""
+    summary = {
+        'processed': [],
+        'partial': [],
+        'failed': [],
+    }
+    pending_orders = db_query_all(
+        '''
+        SELECT o.`id`, o.`user_id`, o.`direction`, o.`request_amount`, o.`note`, o.`operator_id`, o.`created_at`,
+               u.`username`
+        FROM `fund_orders` AS o
+        LEFT JOIN `users` AS u ON o.`user_id` = u.`id`
+        WHERE o.`status` = 'pending'
+        ORDER BY o.`created_at` ASC, o.`id` ASC
+        '''
+    )
+    if not pending_orders:
+        return summary
+
+    now = dt.datetime.now(CHINA_TZ).replace(tzinfo=None)
+    nav_value = nav_value if nav_value > 0 else _default_nav_value()
+    for order in pending_orders:
+        order_id = int(order['id'])
+        user_id = int(order['user_id'])
+        username = order.get('username') or f'用户{user_id}'
+        direction = order['direction']
+        request_amount = float(order['request_amount'])
+        note = order.get('note')
+        operator_id = order.get('operator_id')
+
+        if direction == 'subscribe':
+            shares_delta = request_amount / nav_value
+            cost_delta = request_amount
+            try:
+                new_state = adjust_fund_holding(user_id, shares_delta, cost_delta)
+            except ValueError as exc:
+                db_execute(
+                    'UPDATE `fund_orders` SET `status` = %s, `failure_reason` = %s, `processed_at` = %s, `trade_date` = %s '
+                    'WHERE `id` = %s',
+                    ('failed', str(exc), now, trade_date, order_id),
+                )
+                summary['failed'].append(
+                    {
+                        'id': order_id,
+                        'username': username,
+                        'direction': direction,
+                        'amount': request_amount,
+                        'reason': str(exc),
+                    }
+                )
+                continue
+
+            db_execute(
+                'UPDATE `fund_orders` SET `status` = %s, `processed_at` = %s, `nav_used` = %s, '
+                '`shares_delta` = %s, `cost_delta` = %s, `settled_amount` = %s, `failure_reason` = NULL, '
+                '`trade_date` = %s '
+                'WHERE `id` = %s',
+                ('processed', now, nav_value, shares_delta, cost_delta, request_amount, trade_date, order_id),
+            )
+            db_execute(
+                'INSERT INTO `fund_cash_adjustments` (`amount`, `note`, `operator_id`) VALUES (%s, %s, %s)',
+                (request_amount, f'订单#{order_id} 申购{f" - {note}" if note else ""}', operator_id),
+            )
+            insert_share_adjustment(
+                user_id,
+                shares_delta,
+                cost_delta,
+                f'订单#{order_id} 申购{f" - {note}" if note else ""}',
+                operator_id,
+            )
+            summary['processed'].append(
+                {
+                    'id': order_id,
+                    'username': username,
+                    'direction': direction,
+                    'amount': request_amount,
+                    'settled_amount': request_amount,
+                    'shares_delta': shares_delta,
+                    'new_state': new_state,
+                }
+            )
+        elif direction == 'redeem':
+            holding = _fetch_holding(user_id)
+            available_shares = holding['shares']
+            if available_shares <= 1e-9:
+                reason = '无可用份额'
+                db_execute(
+                    'UPDATE `fund_orders` SET `status` = %s, `failure_reason` = %s, `processed_at` = %s, `trade_date` = %s '
+                    'WHERE `id` = %s',
+                    ('failed', reason, now, trade_date, order_id),
+                )
+                summary['failed'].append(
+                    {
+                        'id': order_id,
+                        'username': username,
+                        'direction': direction,
+                        'amount': request_amount,
+                        'reason': reason,
+                    }
+                )
+                continue
+
+            shares_needed = request_amount / nav_value if nav_value > 0 else 0.0
+            if shares_needed <= 0:
+                reason = '净值异常，无法赎回'
+                db_execute(
+                    'UPDATE `fund_orders` SET `status` = %s, `failure_reason` = %s, `processed_at` = %s, `trade_date` = %s '
+                    'WHERE `id` = %s',
+                    ('failed', reason, now, trade_date, order_id),
+                )
+                summary['failed'].append(
+                    {
+                        'id': order_id,
+                        'username': username,
+                        'direction': direction,
+                        'amount': request_amount,
+                        'reason': reason,
+                    }
+                )
+                continue
+
+            shares_to_use = min(shares_needed, available_shares)
+            settled_amount = shares_to_use * nav_value
+            shares_delta = -shares_to_use
+            cost_delta = _calculate_redemption_cost_delta(holding, shares_to_use)
+
+            try:
+                new_state = adjust_fund_holding(user_id, shares_delta, cost_delta)
+            except ValueError as exc:
+                db_execute(
+                    'UPDATE `fund_orders` SET `status` = %s, `failure_reason` = %s, `processed_at` = %s, `trade_date` = %s '
+                    'WHERE `id` = %s',
+                    ('failed', str(exc), now, trade_date, order_id),
+                )
+                summary['failed'].append(
+                    {
+                        'id': order_id,
+                        'username': username,
+                        'direction': direction,
+                        'amount': request_amount,
+                        'reason': str(exc),
+                    }
+                )
+                continue
+
+            status = 'processed'
+            failure_reason = None
+            if settled_amount + 0.01 < request_amount:
+                status = 'partial'
+                failure_reason = f'份额不足，实际赎回 {settled_amount:.2f}'
+
+            db_execute(
+                'UPDATE `fund_orders` SET `status` = %s, `processed_at` = %s, `nav_used` = %s, '
+                '`shares_delta` = %s, `cost_delta` = %s, `settled_amount` = %s, `failure_reason` = %s, '
+                '`trade_date` = %s '
+                'WHERE `id` = %s',
+                (status, now, nav_value, shares_delta, cost_delta, settled_amount, failure_reason, trade_date, order_id),
+            )
+            db_execute(
+                'INSERT INTO `fund_cash_adjustments` (`amount`, `note`, `operator_id`) VALUES (%s, %s, %s)',
+                (-settled_amount, f'订单#{order_id} 赎回{f" - {note}" if note else ""}', operator_id),
+            )
+            insert_share_adjustment(
+                user_id,
+                shares_delta,
+                cost_delta,
+                f'订单#{order_id} 赎回{f" - {note}" if note else ""}',
+                operator_id,
+            )
+            summary_key = 'processed' if status == 'processed' else 'partial'
+            summary[summary_key].append(
+                {
+                    'id': order_id,
+                    'username': username,
+                    'direction': direction,
+                    'amount': request_amount,
+                    'settled_amount': settled_amount,
+                    'shares_delta': shares_delta,
+                    'new_state': new_state,
+                    'reason': failure_reason,
+                }
+            )
+        else:
+            reason = '未知的订单方向'
+            db_execute(
+                'UPDATE `fund_orders` SET `status` = %s, `failure_reason` = %s, `processed_at` = %s, `trade_date` = %s '
+                'WHERE `id` = %s',
+                ('failed', reason, now, trade_date, order_id),
+            )
+            summary['failed'].append(
+                {
+                    'id': order_id,
+                    'username': username,
+                    'direction': direction,
+                    'amount': request_amount,
+                    'reason': reason,
+                }
+            )
+
+    return summary
+
+
+def _collect_serverchan_keys() -> List[str]:
+    rows = db_query_all(
+        'SELECT `serverchan_send_key` FROM `users` WHERE `serverchan_send_key` IS NOT NULL AND `serverchan_send_key` != ""'
+    )
+    keys = []
+    for row in rows:
+        key = row.get('serverchan_send_key')
+        if key:
+            keys.append(key.strip())
+    return [k for k in keys if k]
+
+
+def _post_serverchan(send_key: str, title: str, desp: str) -> None:
+    url = f'https://sctapi.ftqq.com/{send_key}.send'
+    try:
+        resp = requests.post(url, data={'title': title, 'desp': desp}, timeout=10)
+        if resp.status_code != 200:
+            logger.warning('Server酱推送失败：HTTP %s %s', resp.status_code, resp.text)
+            return
+        data = resp.json()
+        if data.get('code') != 0:
+            logger.warning('Server酱返回异常：%s', data)
+    except Exception as exc:  # pragma: no cover - 网络异常
+        logger.warning('Server酱推送异常：%s', exc)
+
+
+def _format_currency(value: Optional[float]) -> str:
+    if value is None:
+        return '0.00'
+    return f'{value:.2f}'
+
+
+def _format_shares(value: Optional[float]) -> str:
+    if value is None:
+        return '0.00'
+    return f'{value:.2f}'
+
+
+def _send_settlement_notification(
+    trade_date: dt.date,
+    nav_value: float,
+    snapshot: Optional[Dict],
+    summary: Dict,
+) -> None:
+    keys = _collect_serverchan_keys()
+    if not keys:
+        return
+    nav_text = _format_currency(nav_value)
+    total_assets = snapshot.get('total_assets') if snapshot else None
+    total_shares = snapshot.get('total_shares') if snapshot else None
+    cash_amount = snapshot.get('cash_amount') if snapshot else None
+
+    lines: List[str] = []
+    lines.append(f"日期：{trade_date.isoformat()}")
+    lines.append(f"净值：{nav_text}")
+    if total_assets is not None:
+        lines.append(f"总资产：{_format_currency(total_assets)} 元")
+    if total_shares is not None:
+        lines.append(f"总份额：{_format_shares(total_shares)}")
+    if cash_amount is not None:
+        lines.append(f"现金余额：{_format_currency(cash_amount)} 元")
+
+    def _order_line(item: Dict) -> str:
+        direction = '申购' if item['direction'] == 'subscribe' else '赎回'
+        amount_txt = _format_currency(item.get('settled_amount') or item.get('amount'))
+        shares_txt = _format_shares(abs(item.get('shares_delta') or 0.0))
+        base = f"- {item['id']} {item['username']} {direction} {amount_txt} 元（份额 {shares_txt}）"
+        reason = item.get('reason')
+        if reason:
+            base += f" —— {reason}"
+        return base
+
+    if summary['processed'] or summary['partial']:
+        lines.append('\n已处理订单：')
+        for item in summary['processed']:
+            lines.append(_order_line(item))
+        for item in summary['partial']:
+            lines.append(_order_line(item))
+    if summary['failed']:
+        lines.append('\n失败订单：')
+        for item in summary['failed']:
+            lines.append(_order_line(item))
+    if not (summary['processed'] or summary['partial'] or summary['failed']):
+        lines.append('\n今日无申购/赎回订单。')
+
+    title = f"基金日终结算 {trade_date.isoformat()}"
+    desp = '\n'.join(lines)
+    for key in keys:
+        _post_serverchan(key, title, desp)
+
+
+FUND_SETTLEMENT_HOUR = int(os.environ.get('FUND_SETTLEMENT_HOUR', '15'))
+FUND_SETTLEMENT_MINUTE = int(os.environ.get('FUND_SETTLEMENT_MINUTE', '10'))
+FUND_SETTLEMENT_INTERVAL = int(os.environ.get('FUND_SETTLEMENT_INTERVAL', '300'))
+
+
+def _maybe_run_daily_settlement() -> None:
+    now = dt.datetime.now(CHINA_TZ).replace(tzinfo=None)
+    trade_date = now.date()
+    if not _is_trading_day(trade_date):
+        return
+    cutoff = dt.time(hour=FUND_SETTLEMENT_HOUR, minute=FUND_SETTLEMENT_MINUTE)
+    if now.time() < cutoff:
+        return
+    last_run = get_fund_setting('fund_last_settlement_date')
+    pending_exists = db_query_one(
+        'SELECT 1 FROM `fund_orders` WHERE `status` = %s LIMIT 1',
+        ('pending',),
+    )
+    if last_run == trade_date.isoformat() and not pending_exists:
+        return
+
+    nav_value = get_nav_for_settlement()
+    summary = process_pending_fund_orders(nav_value, trade_date)
+    snapshot = build_fund_snapshot()
+    nav_id: Optional[int] = None
+    if snapshot and snapshot.get('total_shares', 0) > 0:
+        nav_id = record_nav_snapshot(snapshot)
+        if nav_id:
+            nav_value = snapshot.get('nav') or nav_value
+            set_fund_setting('fund_last_nav_id', str(nav_id))
+            set_fund_setting('fund_last_nav_value', f"{nav_value:.6f}")
+    record_user_nav_history(trade_date, nav_id, nav_value)
+    set_fund_setting('fund_last_settlement_date', trade_date.isoformat())
+    _send_settlement_notification(trade_date, nav_value, snapshot, summary)
+
+
+def _fund_settlement_worker(app: Flask) -> None:
+    with app.app_context():
+        while True:
+            try:
+                _maybe_run_daily_settlement()
+            except Exception:  # pragma: no cover - 背景线程容错
+                logger.exception('基金结算任务异常')
+            time.sleep(max(FUND_SETTLEMENT_INTERVAL, 60))
+
+
+_start_fund_settlement_thread()
+
+
 def build_fund_snapshot() -> Optional[Dict]:
     base_user_id = get_user_id_by_username('cwjcw')
     if not base_user_id:
@@ -546,6 +1113,46 @@ def record_nav_snapshot(snapshot: Dict) -> Optional[int]:
                 ],
             )
     return nav_id
+
+
+def record_user_nav_history(trade_date: dt.date, nav_id: Optional[int], nav_value: float) -> None:
+    nav_value = nav_value if nav_value > 0 else _default_nav_value()
+    holdings_rows = db_query_all(
+        'SELECT `user_id`, `shares`, `cost_amount` FROM `fund_holdings`'
+    )
+    if not holdings_rows:
+        return
+    payload: List[tuple] = []
+    for row in holdings_rows:
+        shares = float(row.get('shares') or 0.0)
+        cost_amount = float(row.get('cost_amount') or 0.0)
+        value = shares * nav_value
+        profit = value - cost_amount
+        if shares <= 0 and abs(cost_amount) < 0.01 and abs(value) < 0.01:
+            continue
+        payload.append(
+            (
+                row['user_id'],
+                trade_date,
+                nav_id,
+                nav_value,
+                shares,
+                value,
+                cost_amount,
+                profit,
+            )
+        )
+    if not payload:
+        return
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.executemany(
+            'INSERT INTO `fund_user_nav_history` (`user_id`, `snapshot_date`, `nav_id`, `nav`, `shares`, `value`, `cost_amount`, `profit`) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) '
+            'ON DUPLICATE KEY UPDATE `nav_id` = VALUES(`nav_id`), `nav` = VALUES(`nav`), `shares` = VALUES(`shares`), '
+            '`value` = VALUES(`value`), `cost_amount` = VALUES(`cost_amount`), `profit` = VALUES(`profit`)',
+            payload,
+        )
 
 
 def ensure_recent_nav_snapshot(max_age_minutes: int = 5) -> Optional[Dict]:
@@ -1067,18 +1674,21 @@ def fund_overview_view():
     cost_per_share = (cost_amount / shares) if shares > 0 else None
     share_ratio = (shares / total_shares * 100) if total_shares > 0 else None
 
-    nav_history_rows = db_query_all(
-        'SELECT `snapshot_time`, `nav`, `total_assets`, `total_shares`, `cash_amount` FROM `fund_nav_history` ORDER BY `snapshot_time` DESC LIMIT 30'
+    user_nav_rows = db_query_all(
+        'SELECT `snapshot_date`, `nav`, `shares`, `value`, `cost_amount`, `profit` '
+        'FROM `fund_user_nav_history` WHERE `user_id` = %s ORDER BY `snapshot_date` DESC LIMIT 30',
+        (current_user.id,),
     )
-    nav_history = [
+    user_nav_history = [
         {
-            'snapshot_time': row['snapshot_time'],
+            'snapshot_date': row['snapshot_date'],
             'nav': float(row['nav']) if row['nav'] is not None else 0.0,
-            'total_assets': float(row['total_assets']) if row['total_assets'] is not None else 0.0,
-            'total_shares': float(row['total_shares']) if row['total_shares'] is not None else 0.0,
-            'cash_amount': float(row['cash_amount']) if row['cash_amount'] is not None else 0.0,
+            'shares': float(row['shares']) if row['shares'] is not None else 0.0,
+            'value': float(row['value']) if row['value'] is not None else 0.0,
+            'cost_amount': float(row['cost_amount']) if row['cost_amount'] is not None else 0.0,
+            'profit': float(row['profit']) if row['profit'] is not None else 0.0,
         }
-        for row in nav_history_rows
+        for row in user_nav_rows
     ]
 
     latest_positions: List[Dict] = []
@@ -1110,7 +1720,7 @@ def fund_overview_view():
         current_value=current_value,
         profit=profit,
         share_ratio=share_ratio,
-        nav_history=nav_history,
+        nav_history=user_nav_history,
         latest_positions=latest_positions,
     )
 
@@ -1160,6 +1770,50 @@ def _fetch_fund_dashboard_data() -> Dict:
         'SELECT `id`, `amount`, `note`, `created_at` FROM `fund_cash_adjustments` ORDER BY `created_at` DESC LIMIT 20'
     )
 
+    share_logs = db_query_all(
+        '''
+        SELECT
+            a.`id`,
+            a.`delta_shares`,
+            a.`delta_cost_amount`,
+            a.`note`,
+            a.`created_at`,
+            u.`username` AS `user_name`,
+            op.`username` AS `operator_name`
+        FROM `fund_share_adjustments` AS a
+        LEFT JOIN `users` AS u ON a.`user_id` = u.`id`
+        LEFT JOIN `users` AS op ON a.`operator_id` = op.`id`
+        ORDER BY a.`created_at` DESC
+        LIMIT 20
+        '''
+    )
+
+    pending_orders = db_query_all(
+        '''
+        SELECT o.`id`, o.`user_id`, o.`direction`, o.`request_amount`, o.`note`, o.`created_at`,
+               u.`username` AS `user_name`
+        FROM `fund_orders` AS o
+        LEFT JOIN `users` AS u ON o.`user_id` = u.`id`
+        WHERE o.`status` = 'pending'
+        ORDER BY o.`created_at` ASC, o.`id` ASC
+        '''
+    )
+
+    recent_orders = db_query_all(
+        '''
+        SELECT o.`id`, o.`user_id`, o.`direction`, o.`request_amount`, o.`settled_amount`, o.`nav_used`,
+               o.`shares_delta`, o.`status`, o.`failure_reason`, o.`note`, o.`processed_at`,
+               u.`username` AS `user_name`
+        FROM `fund_orders` AS o
+        LEFT JOIN `users` AS u ON o.`user_id` = u.`id`
+        WHERE o.`status` != 'pending'
+        ORDER BY o.`processed_at` DESC, o.`id` DESC
+        LIMIT 20
+        '''
+    )
+
+    last_settlement_date = get_fund_setting('fund_last_settlement_date')
+
     return {
         'users': user_rows,
         'nav_record': nav_record,
@@ -1174,6 +1828,11 @@ def _fetch_fund_dashboard_data() -> Dict:
         'initialized_at': initialized_at,
         'initialized_by': initialized_by,
         'cash_logs': cash_logs,
+        'share_logs': share_logs,
+        'pending_orders': pending_orders,
+        'recent_orders': recent_orders,
+        'last_settlement_date': last_settlement_date,
+        'reset_token_required': bool(os.environ.get('FUND_RESET_TOKEN')),
     }
 
 
@@ -1224,6 +1883,152 @@ def fund_manager_update_holding():
     return redirect(url_for('fund_manager_dashboard'))
 
 
+@app.route('/manager/fund/holdings/adjust', methods=['POST'])
+@login_required
+@manager_required
+def fund_manager_adjust_holding():
+    user_id_raw = request.form.get('user_id', '').strip()
+    delta_shares_raw = request.form.get('delta_shares', '').strip()
+    delta_cost_raw = request.form.get('delta_cost_amount', '').strip()
+    note = (request.form.get('note') or '').strip()
+    try:
+        user_id = int(user_id_raw)
+    except (TypeError, ValueError):
+        flash('无效的用户ID', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    user_row = db_query_one('SELECT `id`, `username` FROM `users` WHERE `id` = %s', (user_id,))
+    if not user_row:
+        flash('用户不存在', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    try:
+        delta_shares = float(delta_shares_raw)
+    except (TypeError, ValueError):
+        flash('请输入有效的调整份额', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    if abs(delta_shares) < 1e-9:
+        flash('调整份额不能为0', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    try:
+        delta_cost = float(delta_cost_raw) if delta_cost_raw else 0.0
+    except (TypeError, ValueError):
+        flash('请输入有效的成本调整金额', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    holding = db_query_one(
+        'SELECT `shares`, `cost_amount` FROM `fund_holdings` WHERE `user_id` = %s',
+        (user_id,),
+    )
+    current_shares = float(holding['shares']) if holding else 0.0
+    current_cost = float(holding['cost_amount']) if holding else 0.0
+    new_shares = current_shares + delta_shares
+    new_cost = current_cost + delta_cost
+    eps = 1e-9
+
+    if new_shares < -eps:
+        flash('调整后份额不能为负数', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    # 允许成本因浮点误差略小于0
+    if new_cost < -0.01:
+        flash('调整后成本不能为负数', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    if new_shares <= eps:
+        db_execute('DELETE FROM `fund_holdings` WHERE `user_id` = %s', (user_id,))
+        new_shares = 0.0
+        new_cost = 0.0
+    else:
+        if holding:
+            db_execute(
+                'UPDATE `fund_holdings` SET `shares` = %s, `cost_amount` = %s WHERE `user_id` = %s',
+                (new_shares, max(new_cost, 0.0), user_id),
+            )
+        else:
+            if new_cost < -eps:
+                flash('新持仓成本不能为负数', 'error')
+                return redirect(url_for('fund_manager_dashboard'))
+            db_execute(
+                'INSERT INTO `fund_holdings` (`user_id`, `shares`, `cost_amount`) VALUES (%s, %s, %s)',
+                (user_id, new_shares, max(new_cost, 0.0)),
+            )
+
+    db_execute(
+        'INSERT INTO `fund_share_adjustments` (`user_id`, `delta_shares`, `delta_cost_amount`, `note`, `operator_id`) '
+        'VALUES (%s, %s, %s, %s, %s)',
+        (user_id, delta_shares, delta_cost, note or None, current_user.id),
+    )
+
+    username = user_row['username']
+    flash(
+        f'已为 {username} 调整基金份额 {delta_shares:+.2f}，当前份额 {new_shares:.2f}。',
+        'success',
+    )
+    return redirect(url_for('fund_manager_dashboard'))
+
+
+@app.route('/manager/fund/orders', methods=['POST'])
+@login_required
+@manager_required
+def fund_manager_create_order():
+    user_id_raw = request.form.get('user_id', '').strip()
+    direction = (request.form.get('direction') or '').strip().lower()
+    amount_raw = request.form.get('amount', '').strip()
+    note = (request.form.get('note') or '').strip() or None
+    try:
+        user_id = int(user_id_raw)
+    except (TypeError, ValueError):
+        flash('无效的用户ID', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    user_row = db_query_one('SELECT `id`, `username` FROM `users` WHERE `id` = %s', (user_id,))
+    if not user_row:
+        flash('用户不存在', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    if direction not in {'subscribe', 'redeem'}:
+        flash('请选择正确的操作类型', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    try:
+        amount = float(amount_raw)
+    except (TypeError, ValueError):
+        flash('请输入有效的金额', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    if amount <= 0:
+        flash('金额必须大于0', 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    try:
+        order_id = create_fund_order(user_id, direction, amount, note, current_user.id)
+    except ValueError as exc:
+        flash(str(exc), 'error')
+        return redirect(url_for('fund_manager_dashboard'))
+
+    operation = '申购' if direction == 'subscribe' else '赎回'
+    flash(f'已为 {user_row["username"]} 创建{operation}订单 #{order_id}，等待收盘后处理。', 'success')
+    return redirect(url_for('fund_manager_dashboard'))
+
+
+@app.route('/manager/fund/reset', methods=['POST'])
+@login_required
+@manager_required
+def fund_manager_reset():
+    token = (request.form.get('reset_token') or '').strip()
+    expected = os.environ.get('FUND_RESET_TOKEN')
+    if expected:
+        if not token or token != expected:
+            flash('口令错误，无法重置。', 'error')
+            return redirect(url_for('fund_manager_dashboard'))
+    reset_fund_data()
+    flash('已清空基金相关数据。', 'success')
+    return redirect(url_for('fund_manager_dashboard'))
+
+
 @app.route('/manager/fund/cash', methods=['POST'])
 @login_required
 @manager_required
@@ -1251,7 +2056,7 @@ def fund_manager_adjust_cash():
 @manager_required
 def fund_manager_initialize():
     token = (request.form.get('auth_token') or '').strip()
-    if token != 'weijie81':
+    if token != '123456':
         flash('初始化口令不正确，操作已取消。', 'error')
         return redirect(url_for('fund_manager_dashboard'))
 
@@ -1273,6 +2078,7 @@ def fund_manager_initialize():
     set_fund_setting('fund_initialized_by', str(current_user.id))
     set_fund_setting('fund_initial_nav_id', str(nav_id))
     set_fund_setting('fund_initial_nav_value', f"{snapshot['nav']:.6f}")
+    record_user_nav_history(now.date(), nav_id, snapshot['nav'])
     flash('基金已完成初始化基准，已记录当前仓位与净值。', 'success')
     return redirect(url_for('fund_manager_dashboard'))
 
