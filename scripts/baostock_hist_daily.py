@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS `stock_daily_baostock` (
     `市销率_TTM` DOUBLE NULL,
     `市现率_TTM` DOUBLE NULL,
     `是否ST` VARCHAR(4) NULL,
+    `写入时间` DATETIME NULL,
     PRIMARY KEY (`ts_code`, `日期`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
@@ -185,8 +186,8 @@ def save_rows(dsn: str, rows: List[Tuple]) -> None:
                 "INSERT INTO `stock_daily_baostock` ("
                 "`ts_code`,`股票代码`,`股票名称`,`日期`,`开盘`,`最高`,`最低`,`收盘`,"
                 "`成交量`,`成交额`,`复权`,`换手率`,`交易状态`,`涨跌幅`,"
-                "`市盈率_TTM`,`市净率`,`市销率_TTM`,`市现率_TTM`,`是否ST`"
-                ") VALUES (" + ",".join(["%s"] * 19) + ") "
+                "`市盈率_TTM`,`市净率`,`市销率_TTM`,`市现率_TTM`,`是否ST`,`写入时间`"
+                ") VALUES (" + ",".join(["%s"] * 20) + ") "
                 "ON DUPLICATE KEY UPDATE "
                 "`股票代码`=VALUES(`股票代码`),"
                 "`股票名称`=VALUES(`股票名称`),"
@@ -196,12 +197,25 @@ def save_rows(dsn: str, rows: List[Tuple]) -> None:
                 "`换手率`=VALUES(`换手率`),`交易状态`=VALUES(`交易状态`),"
                 "`涨跌幅`=VALUES(`涨跌幅`),`市盈率_TTM`=VALUES(`市盈率_TTM`),"
                 "`市净率`=VALUES(`市净率`),`市销率_TTM`=VALUES(`市销率_TTM`),"
-                "`市现率_TTM`=VALUES(`市现率_TTM`),`是否ST`=VALUES(`是否ST`)"
+                "`市现率_TTM`=VALUES(`市现率_TTM`),`是否ST`=VALUES(`是否ST`),"
+                "`写入时间`=VALUES(`写入时间`)"
             )
             cursor.executemany(sql, rows)
         conn.commit()
     finally:
         conn.close()
+
+
+def to_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "" or text.lower() == "null":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def main() -> None:
@@ -286,21 +300,22 @@ def main() -> None:
                         ts_code.split(".", 1)[0],
                         name,
                         row.get("date"),
-                        row.get("open"),
-                        row.get("high"),
-                        row.get("low"),
-                        row.get("close"),
-                        row.get("volume"),
-                        row.get("amount"),
+                        to_float(row.get("open")),
+                        to_float(row.get("high")),
+                        to_float(row.get("low")),
+                        to_float(row.get("close")),
+                        to_float(row.get("volume")),
+                        to_float(row.get("amount")),
                         adjust_label,
-                        row.get("turn"),
+                        to_float(row.get("turn")),
                         row.get("tradestatus"),
-                        row.get("pctChg"),
-                        row.get("peTTM"),
-                        row.get("pbMRQ"),
-                        row.get("psTTM"),
-                        row.get("pcfNcfTTM"),
+                        to_float(row.get("pctChg")),
+                        to_float(row.get("peTTM")),
+                        to_float(row.get("pbMRQ")),
+                        to_float(row.get("psTTM")),
+                        to_float(row.get("pcfNcfTTM")),
                         row.get("isST"),
+                        dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     )
                 )
                 if len(rows) >= args.batch_size:
