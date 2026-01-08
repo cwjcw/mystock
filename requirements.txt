@@ -7,4 +7,3 @@ Werkzeug>=2.3
 akshare>=1.17.54
 PyMySQL>=1.1
 cryptography>=46.0.1
-tushare>=1.2.89

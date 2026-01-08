@@ -14,11 +14,14 @@ if __package__ is None or __package__ == "":
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
     from scripts.daily_bulk_flow import BULK_WORKERS_DEFAULT, is_trading_day, run_for_date
+    from scripts.env_utils import load_env
 else:
     from .daily_bulk_flow import BULK_WORKERS_DEFAULT, is_trading_day, run_for_date
+    from .env_utils import load_env
 
 
 def main() -> None:
+    load_env()
     parser = argparse.ArgumentParser(description="Fetch fund flow data for a date if it is a trading day")
     parser.add_argument(
         "--date",
@@ -26,7 +29,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--dsn",
-        default=os.environ.get("MYSQL_DSN"),
+        default=None,
         help="MySQL DSN (默认读取环境变量 MYSQL_DSN)",
     )
     parser.add_argument(
@@ -51,6 +54,8 @@ def main() -> None:
         print(f"{target_date} 非交易日，跳过读取。")
         return
 
+    if not args.dsn:
+        args.dsn = os.environ.get("MYSQL_DSN") or os.environ.get("APP_MYSQL_DSN")
     if not args.dsn:
         raise SystemExit("缺少 MySQL DSN，请通过 --dsn 或环境变量 MYSQL_DSN 提供")
 

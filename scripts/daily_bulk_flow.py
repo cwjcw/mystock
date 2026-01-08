@@ -21,6 +21,7 @@ try:
         extract_stock_name,
         parse_stock_code,
     )  # type: ignore
+    from scripts.env_utils import load_env
 except ModuleNotFoundError:
     import os, sys
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
@@ -32,6 +33,7 @@ except ModuleNotFoundError:
         extract_stock_name,
         parse_stock_code,
     )
+    from env_utils import load_env  # type: ignore
 
 
 EM_HEADERS = {
@@ -71,14 +73,7 @@ PROXY_REFRESH_INTERVAL = 900
 _proxy_timestamp: Optional[float] = None
 
 
-ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
-if ENV_FILE.exists():
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith('#') or '=' not in line:
-            continue
-        k, v = line.split('=', 1)
-        os.environ.setdefault(k.strip(), v.strip())
+load_env()
 PROXY_API_URL = os.getenv("PROXY_API_URL")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
@@ -349,7 +344,7 @@ def main():
     parser = argparse.ArgumentParser(description="Daily bulk fund flow to SQLite at 16:00")
     parser.add_argument(
         "--dsn",
-        required=True,
+        default=None,
         help="MySQL DSN (例如 mysql://user:pwd@host:3306/mystock?charset=utf8mb4)",
     )
     parser.add_argument("--date", help="Run once for date YYYY-MM-DD (no schedule)")
@@ -375,6 +370,11 @@ def main():
         help="Force refresh cached stock code list",
     )
     args = parser.parse_args()
+
+    if not args.dsn:
+        args.dsn = os.environ.get("MYSQL_DSN") or os.environ.get("APP_MYSQL_DSN")
+    if not args.dsn:
+        raise SystemExit("缺少 MySQL DSN，请通过 --dsn 或环境变量 MYSQL_DSN 提供")
 
     workers = max(1, args.workers or BULK_WORKERS_DEFAULT)
     if args.full_history:

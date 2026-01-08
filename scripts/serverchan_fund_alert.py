@@ -17,9 +17,11 @@ import requests
 # MySQL access for watchlist
 try:
     from mysql_utils import connect_mysql  # type: ignore
+    from env_utils import load_env
 except ImportError:  # pragma: no cover - fallback when running as module
     try:
         from .mysql_utils import connect_mysql  # type: ignore
+        from .env_utils import load_env  # type: ignore
     except ImportError:  # pragma: no cover
         connect_mysql = None  # type: ignore
 
@@ -36,12 +38,6 @@ TRADING_SESSIONS: Tuple[Tuple[dt.time, dt.time], ...] = (
     (dt.time(hour=9, minute=30), dt.time(hour=11, minute=30)),
     (dt.time(hour=13, minute=0), dt.time(hour=15, minute=0)),
 )
-
-ENV_FILE_CANDIDATES = (
-    Path(".env"),
-    Path(__file__).resolve().parent.parent / ".env",
-)
-
 
 @dataclass
 class StockSnapshot:
@@ -143,21 +139,6 @@ def _disable_proxies() -> None:
         os.environ.pop(key, None)
     os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
     os.environ.setdefault("no_proxy", "localhost,127.0.0.1")
-
-
-def load_env() -> None:
-    for path in ENV_FILE_CANDIDATES:
-        if not path.exists():
-            continue
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and value and key not in os.environ:
-                os.environ[key] = value
 
 
 def load_user_watch_configs() -> List[UserWatchConfig]:

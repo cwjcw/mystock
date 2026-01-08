@@ -9,12 +9,14 @@ import requests
 from pymysql.cursors import Cursor
 
 try:
+    from .env_utils import load_env
     from .mysql_utils import connect_mysql
 except ImportError:  # pragma: no cover
     import sys
     import pathlib
 
     sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+    from env_utils import load_env  # type: ignore
     from mysql_utils import connect_mysql  # type: ignore
 
 
@@ -354,6 +356,7 @@ def save_to_mysql(
 
 
 def main():
+    load_env()
     parser = argparse.ArgumentParser(description="Fetch A-share fund flow via AKShare")
     parser.add_argument("codes", nargs="+", help="Stock codes like 600519, sh600519, 000001.SZ")
     parser.add_argument("--date", dest="date", help="Specific date YYYY-MM-DD")
@@ -364,13 +367,15 @@ def main():
     parser.add_argument(
         "--dsn",
         dest="dsn",
-        default=os.environ.get("MYSQL_DSN"),
+        default=None,
         help="MySQL DSN，例如 mysql://user:pwd@host:3306/mystock?charset=utf8mb4",
     )
     parser.add_argument("--xq-token", dest="xq_token", help="Override Xueqiu token for basic info")
     parser.add_argument("--timeout", type=float, default=None, help="Request timeout for Xueqiu basic info")
     parser.add_argument("--earliest", action="store_true", help="Only print earliest available date for each code")
     args = parser.parse_args()
+    if not args.dsn:
+        args.dsn = os.environ.get("MYSQL_DSN") or os.environ.get("APP_MYSQL_DSN")
 
     start = args.start or args.date
     end = args.end or args.date

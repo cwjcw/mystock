@@ -18,11 +18,9 @@ import sys
 from pathlib import Path
 from typing import Iterable, List
 
+from env_utils import load_env
 from mysql_utils import MySQLConfigError, connect_mysql
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ENV_FILE = PROJECT_ROOT / ".env"
 
 # Dates provided by the user (2024 Mainland holiday window)
 DEFAULT_DATES = [
@@ -39,20 +37,6 @@ DEFAULT_DATES = [
     dt.date(2024, 10, 11),
     dt.date(2024, 10, 12),
 ]
-
-
-def load_env() -> None:
-    if not ENV_FILE.exists():
-        return
-    for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        val = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = val
 
 
 def parse_dates(values: Iterable[str]) -> List[dt.date]:

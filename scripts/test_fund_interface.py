@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import os
 
+from scripts.env_utils import load_env
 from scripts.mysql_utils import connect_mysql
 
 
 def main() -> None:
-    dsn = os.environ.get("MYSQL_DSN")
+    load_env()
+    dsn = os.environ.get("MYSQL_DSN") or os.environ.get("APP_MYSQL_DSN")
     if not dsn:
         raise SystemExit("请先在环境变量 MYSQL_DSN 中配置 MySQL 连接串")
 
