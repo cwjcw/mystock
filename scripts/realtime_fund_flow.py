@@ -27,6 +27,17 @@ except Exception:
 
 INDICATOR_CHOICES = ["今日", "3日", "5日", "10日"]
 
+EM_HEADERS = {
+    "Referer": "https://quote.eastmoney.com/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/114.0.0.0 Safari/537.36"
+    ),
+}
+# 仅查询沪深 A 股（含创业板、科创板），剔除指数、债券等
+EM_FS_FILTERS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+
 
 def disable_proxies() -> None:
     for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
@@ -107,6 +118,109 @@ def fetch_rank(indicator: str, *, _fallback: bool = True) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["指标"] = indicator
     return df
+
+
+def fetch_all_realtime_flow(page_size: int = 500, *, _fallback: bool = True) -> pd.DataFrame:
+    def _fetch_all_pages() -> pd.DataFrame:
+        rows: List[Dict] = []
+        pn = 1
+        total: Optional[int] = None
+        while True:
+            params = {
+                "pn": pn,
+                "pz": page_size,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f62",
+                "fs": EM_FS_FILTERS,
+                "fields": ",".join(
+                    [
+                        "f12",  # code
+                        "f14",  # name
+                        "f2",  # last price
+                        "f3",  # pct chg
+                        "f62",  # main net
+                        "f184",  # main ratio
+                        "f66",  # ultra large net
+                        "f69",  # ultra large ratio
+                        "f72",  # large net
+                        "f75",  # large ratio
+                        "f78",  # medium net
+                        "f81",  # medium ratio
+                        "f84",  # small net
+                        "f87",  # small ratio
+                    ]
+                ),
+            }
+            r = requests.get(
+                "https://push2.eastmoney.com/api/qt/clist/get",
+                params=params,
+                headers=EM_HEADERS,
+                timeout=10,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            data = (payload or {}).get("data") or {}
+            diff = data.get("diff") or []
+            if not diff:
+                break
+            rows.extend(diff)
+            if total is None:
+                try:
+                    total = int(data.get("total")) if data.get("total") is not None else None
+                except (TypeError, ValueError):
+                    total = None
+            if total is not None:
+                pages = (total + page_size - 1) // page_size
+                if pn >= pages:
+                    break
+            pn += 1
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        rename_map = {
+            "f12": "代码",
+            "f14": "名称",
+            "f2": "最新价",
+            "f3": "涨跌幅",
+            "f62": "主力净流入-净额",
+            "f184": "主力净流入-净占比",
+            "f66": "超大单净流入-净额",
+            "f69": "超大单净流入-净占比",
+            "f72": "大单净流入-净额",
+            "f75": "大单净流入-净占比",
+            "f78": "中单净流入-净额",
+            "f81": "中单净流入-净占比",
+            "f84": "小单净流入-净额",
+            "f87": "小单净流入-净占比",
+        }
+        df.rename(columns=rename_map, inplace=True)
+        df.insert(0, "序号", range(1, len(df) + 1))
+        df["代码"] = df["代码"].astype(str).apply(normalize_code)
+        for col in df.columns:
+            if col in {"序号", "代码", "名称"}:
+                continue
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["指标"] = "今日"
+        return df
+
+    try:
+        return _fetch_all_pages()
+    except requests.exceptions.ProxyError:
+        if _fallback and _has_proxy_env():
+            print("检测到代理连接失败，自动禁用代理后重试…")
+            disable_proxies()
+            return fetch_all_realtime_flow(page_size, _fallback=False)
+        raise
+    except requests.exceptions.RequestException:
+        if _fallback and _has_proxy_env():
+            print("检测到网络异常，自动禁用代理后重试…")
+            disable_proxies()
+            return fetch_all_realtime_flow(page_size, _fallback=False)
+        raise
 
 
 def filter_for_targets(df: pd.DataFrame, targets: Dict[str, str]) -> pd.DataFrame:
@@ -319,6 +433,17 @@ def main() -> None:
         default="今日",
         help="Ranking indicator window (default: 今日)",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Fetch all A-share realtime fund flow via Eastmoney list API (today only)",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=500,
+        help="Page size for --all (default: 500)",
+    )
     parser.add_argument("--top", type=int, default=20, help="Rows to display when no targets provided")
     parser.add_argument("--interval", type=int, default=60, help="Polling interval seconds")
     parser.add_argument("--once", action="store_true", help="Fetch once and exit")
@@ -346,7 +471,13 @@ def main() -> None:
         timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n== {timestamp} {args.indicator} ==")
         try:
-            df = fetch_rank(args.indicator)
+            if args.all:
+                if args.indicator != "今日":
+                    print("提示: --all 仅支持今日实时资金流，已自动切换为 今日。")
+                    args.indicator = "今日"
+                df = fetch_all_realtime_flow(page_size=max(1, args.page_size))
+            else:
+                df = fetch_rank(args.indicator)
         except Exception as exc:
             print(f"获取排名数据失败: {exc}")
             df = pd.DataFrame()
