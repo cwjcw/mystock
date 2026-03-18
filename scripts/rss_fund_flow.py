@@ -17,6 +17,20 @@ DEFAULT_HEADERS = {
 }
 
 
+def _parse_date(text: Optional[str]) -> Optional[dt.date]:
+    if not text:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def symbol_to_secid(symbol: str) -> str:
     code, exch = symbol.upper().split(".")
     return ("1." if exch == "SH" else "0.") + code
@@ -94,7 +108,7 @@ async def fetch_quote_basic(session: aiohttp.ClientSession, secid: str) -> Optio
 
 
 async def fetch_fund_quote(session: aiohttp.ClientSession, code: str) -> Optional[dict]:
-    """Fetch fund realtime estimate (GSZ) via jsonp endpoint."""
+    """Fetch fund quote; choose fresher data between fundgz and pingzhongdata."""
     base = code.upper().split('.', 1)[0]
     url = f"https://fundgz.1234567.com.cn/js/{base}.js"
     headers = {
@@ -109,8 +123,11 @@ async def fetch_fund_quote(session: aiohttp.ClientSession, code: str) -> Optiona
                 text = ""
     except Exception:
         text = ""
+    fundgz_quote: Optional[dict] = None
+    fundgz_date: Optional[dt.date] = None
+
     text = text.strip()
-    if text.startswith("jsonpgz("):
+    if text.startswith("jsonpgz(") and text.endswith(");"):
         payload = text[len("jsonpgz(") : -2]
         try:
             data = json.loads(payload)
@@ -132,32 +149,47 @@ async def fetch_fund_quote(session: aiohttp.ClientSession, code: str) -> Optiona
                 change_pct = float(chg)
             except (TypeError, ValueError):
                 change_pct = None
-            return {"name": name, "price": price, "change_pct": change_pct, "market_cap": None}
+            fundgz_quote = {"name": name, "price": price, "change_pct": change_pct, "market_cap": None}
+            # fundgz 对部分 QDII 可能长期停更，优先用可解析出的最新日期判定是否过期
+            fundgz_date = _parse_date(data.get("gztime")) or _parse_date(data.get("jzrq"))
 
-    # Fallback to pingzhongdata (daily NAV)
+    # pingzhongdata: daily NAV
     url = f"https://fund.eastmoney.com/pingzhongdata/{base}.js"
     try:
         async with session.get(url, headers=headers, timeout=10) as resp:
             if resp.status != 200:
-                return None
+                return fundgz_quote
             js_text = await resp.text()
     except Exception:
-        return None
+        return fundgz_quote
     name_match = re.search(r'var fS_name\s*=\s*"(.*?)";', js_text)
     data_match = re.search(r"var Data_netWorthTrend\s*=\s*(\[.*?\]);", js_text)
     if not data_match:
-        return None
+        return fundgz_quote
     try:
         trend = json.loads(data_match.group(1))
     except Exception:
-        return None
+        return fundgz_quote
     if not trend:
-        return None
+        return fundgz_quote
     latest = trend[-1]
-    price = latest.get('y')
-    change_pct = latest.get('equityReturn')
+    latest_date = None
+    try:
+        latest_date = dt.datetime.fromtimestamp(int(latest.get("x", 0)) / 1000).date()
+    except Exception:
+        latest_date = None
+    price = latest.get("y")
+    change_pct = latest.get("equityReturn")
     name = name_match.group(1) if name_match else None
-    return {"name": name, "price": price, "change_pct": change_pct, "market_cap": None}
+    ping_quote = {"name": name, "price": price, "change_pct": change_pct, "market_cap": None}
+
+    if fundgz_quote is None:
+        return ping_quote
+    if latest_date and fundgz_date and latest_date > fundgz_date:
+        return ping_quote
+    if latest_date and not fundgz_date:
+        return ping_quote
+    return fundgz_quote
 
 
 
