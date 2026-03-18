@@ -223,3 +223,4 @@ proxy_*.txt
 
 # nohup output
 nohup.out
+stock_price_alerts.txt
