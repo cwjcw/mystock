@@ -92,6 +92,12 @@ _RL_BUCKETS: dict[str, deque] = defaultdict(deque)
 _TRADING_CAL_CACHE: Optional[Set[str]] = None
 _TRADING_CAL_LAST_FETCH: Optional[float] = None
 _TRADING_CAL_TTL_SECONDS = 6 * 3600  # refresh trading calendar every 6 hours by default
+PRICE_ALERT_RULES_FILE = Path(os.environ.get('PRICE_ALERT_RULES_FILE', str(DATA_DIR / 'stock_price_alerts.txt')))
+PRICE_ALERT_INTERVAL = max(15, int(os.environ.get('PRICE_ALERT_INTERVAL', '30')))
+PRICE_ALERT_DAILY_HOUR = int(os.environ.get('PRICE_ALERT_DAILY_HOUR', '14'))
+PRICE_ALERT_DAILY_MINUTE = int(os.environ.get('PRICE_ALERT_DAILY_MINUTE', '35'))
+PRICE_ALERT_PRICE_DECIMALS = max(0, int(os.environ.get('PRICE_ALERT_PRICE_DECIMALS', '2')))
+PRICE_ALERT_ENABLED = os.environ.get('PRICE_ALERT_ENABLED', '1').lower() not in {'0', 'false', 'no'}
 
 
 def _rate_check_and_consume(key: str):
@@ -415,6 +421,7 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 _FUND_SETTLEMENT_THREAD_STARTED = False
+_PRICE_ALERT_THREAD_STARTED = False
 
 
 def _start_fund_settlement_thread():
@@ -424,6 +431,258 @@ def _start_fund_settlement_thread():
     thread = threading.Thread(target=_fund_settlement_worker, args=(app,), daemon=True)
     thread.start()
     _FUND_SETTLEMENT_THREAD_STARTED = True
+
+
+def _normalize_stock_symbol_for_alert(raw: str) -> Optional[str]:
+    parsed = _parse_symbols(raw.strip())
+    if not parsed:
+        return None
+    symbol = parsed[0]['symbol'].strip().upper()
+    if symbol.endswith('.SH') or symbol.endswith('.SZ'):
+        return symbol
+    return None
+
+
+def _ensure_price_alert_rule_file() -> None:
+    if PRICE_ALERT_RULES_FILE.exists():
+        return
+    PRICE_ALERT_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PRICE_ALERT_RULES_FILE.write_text(
+        (
+            "# 股票价格推送规则\n"
+            "# 每行格式: 股票代码,比较符,价格,备注(可选)\n"
+            "# 比较符支持: >= <= > < =\n"
+            "# 股票代码支持: 600519 / sh600519 / 600519.SH\n"
+            "# 同一股票可以写多行（不同价位或不同备注）\n"
+            "600519,>=,1800,突破提醒\n"
+            "600519,<=,1700,回落提醒\n"
+            "000001,>=,12.50,关注压力位\n"
+        ),
+        encoding='utf-8',
+    )
+
+
+def _load_price_alert_rules() -> List[Dict]:
+    if not PRICE_ALERT_RULES_FILE.exists():
+        return []
+    rules: List[Dict] = []
+    try:
+        lines = PRICE_ALERT_RULES_FILE.read_text(encoding='utf-8').splitlines()
+    except Exception as exc:
+        logger.warning('读取价格提醒规则文件失败: %s', exc)
+        return rules
+    valid_ops = {'>=', '<=', '>', '<', '='}
+    for idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split(',', 3)]
+        if len(parts) < 3:
+            logger.warning('价格提醒规则格式无效(第%s行): %s', idx, raw_line)
+            continue
+        symbol_raw, op, target_raw = parts[0], parts[1], parts[2]
+        note = parts[3] if len(parts) >= 4 else ''
+        symbol = _normalize_stock_symbol_for_alert(symbol_raw)
+        if not symbol:
+            logger.warning('价格提醒规则股票代码无效(第%s行): %s', idx, raw_line)
+            continue
+        if op not in valid_ops:
+            logger.warning('价格提醒规则比较符无效(第%s行): %s', idx, raw_line)
+            continue
+        try:
+            target = float(target_raw)
+        except (TypeError, ValueError):
+            logger.warning('价格提醒规则价格无效(第%s行): %s', idx, raw_line)
+            continue
+        if target <= 0:
+            logger.warning('价格提醒规则价格需大于0(第%s行): %s', idx, raw_line)
+            continue
+        digest = f"{symbol}|{op}|{target:.6f}|{note}"
+        rule_id = hashlib.sha1(digest.encode('utf-8')).hexdigest()[:16]
+        rules.append(
+            {
+                'id': rule_id,
+                'symbol': symbol,
+                'op': op,
+                'target': target,
+                'note': note,
+            }
+        )
+    return rules
+
+
+def _fetch_stock_quotes_for_alert(symbols: List[str]) -> Dict[str, dict]:
+    if not symbols:
+        return {}
+
+    async def gather() -> Dict[str, dict]:
+        connector = aiohttp.TCPConnector(limit=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async def fetch_one(sym: str):
+                try:
+                    secid = symbol_to_secid(sym)
+                except Exception:
+                    return None
+                return await fetch_quote_basic(session, secid)
+
+            tasks = [fetch_one(sym) for sym in symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        out: Dict[str, dict] = {}
+        for sym, res in zip(symbols, results):
+            if isinstance(res, Exception) or res is None:
+                continue
+            out[sym] = res
+        return out
+
+    try:
+        return asyncio.run(gather())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(gather())
+        finally:
+            loop.close()
+
+
+def _is_price_condition_hit(price: float, op: str, target: float) -> bool:
+    if op == '>=':
+        return price >= target
+    if op == '<=':
+        return price <= target
+    if op == '>':
+        return price > target
+    if op == '<':
+        return price < target
+    # '='
+    return abs(price - target) < 1e-9
+
+
+def _collect_price_alert_keys() -> List[str]:
+    keys = _collect_serverchan_keys()
+    env_key = (os.environ.get('PRICE_ALERT_SEND_KEY') or '').strip()
+    if env_key:
+        keys.append(env_key)
+    deduped: List[str] = []
+    seen = set()
+    for key in keys:
+        if key and key not in seen:
+            deduped.append(key)
+            seen.add(key)
+    return deduped
+
+
+def _send_price_alert_notification(title: str, lines: List[str]) -> None:
+    keys = _collect_price_alert_keys()
+    if not keys:
+        return
+    desp = '\n'.join(lines)
+    for key in keys:
+        _post_serverchan(key, title, desp)
+
+
+def _start_price_alert_worker() -> None:
+    global _PRICE_ALERT_THREAD_STARTED
+    if _PRICE_ALERT_THREAD_STARTED:
+        return
+
+    def _worker() -> None:
+        rule_price_counter: Dict[str, Dict[float, int]] = defaultdict(dict)
+        rule_total_counter: Dict[str, int] = {}
+        counter_day: Optional[dt.date] = None
+        daily_sent_day: Optional[dt.date] = None
+        daily_cutoff = dt.time(hour=PRICE_ALERT_DAILY_HOUR, minute=PRICE_ALERT_DAILY_MINUTE)
+
+        with app.app_context():
+            _ensure_price_alert_rule_file()
+            while True:
+                try:
+                    now = dt.datetime.now(CHINA_TZ).replace(tzinfo=None)
+                    today = now.date()
+                    if counter_day != today:
+                        rule_price_counter = defaultdict(dict)
+                        rule_total_counter = {}
+                        counter_day = today
+
+                    rules = _load_price_alert_rules()
+                    if not rules:
+                        time.sleep(PRICE_ALERT_INTERVAL)
+                        continue
+
+                    symbols = sorted({r['symbol'] for r in rules})
+                    quotes = _fetch_stock_quotes_for_alert(symbols)
+
+                    trigger_lines: List[str] = []
+                    for rule in rules:
+                        quote = quotes.get(rule['symbol'])
+                        if not quote:
+                            continue
+                        price_raw = quote.get('price')
+                        try:
+                            price = float(price_raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if not _is_price_condition_hit(price, rule['op'], float(rule['target'])):
+                            continue
+                        rounded_price = round(price, PRICE_ALERT_PRICE_DECIMALS)
+                        total_count = int(rule_total_counter.get(rule['id'], 0))
+                        if total_count >= 2:
+                            continue
+                        same_price_count = rule_price_counter[rule['id']].get(rounded_price, 0)
+                        if same_price_count >= 2:
+                            continue
+                        rule_price_counter[rule['id']][rounded_price] = same_price_count + 1
+                        rule_total_counter[rule['id']] = total_count + 1
+                        name = quote.get('name') or rule['symbol']
+                        chg = quote.get('change_pct')
+                        chg_text = '-' if chg is None else f"{float(chg):.2f}%"
+                        note_text = f"；备注: {rule['note']}" if rule.get('note') else ''
+                        trigger_lines.append(
+                            f"- {rule['symbol']} {name} 现价 {price:.2f}，条件 {rule['op']} {float(rule['target']):.2f}，涨跌幅 {chg_text}{note_text}"
+                        )
+
+                    if trigger_lines:
+                        title = f"股票价格触发提醒 {now.strftime('%Y-%m-%d %H:%M:%S')}"
+                        lines = [
+                            f"时间: {now.strftime('%Y-%m-%d %H:%M:%S')}",
+                            "触发规则:",
+                            *trigger_lines,
+                            "",
+                            "说明: 非14:35定时播报场景下，每条规则每日最多推送2次。",
+                        ]
+                        _send_price_alert_notification(title, lines)
+
+                    if now.time() >= daily_cutoff and daily_sent_day != today:
+                        daily_lines = [f"时间: {now.strftime('%Y-%m-%d %H:%M:%S')}", "14:35 定时价格播报:"]
+                        for symbol in symbols:
+                            quote = quotes.get(symbol)
+                            if not quote:
+                                daily_lines.append(f"- {symbol} 行情获取失败")
+                                continue
+                            name = quote.get('name') or symbol
+                            price_raw = quote.get('price')
+                            chg_raw = quote.get('change_pct')
+                            try:
+                                price_text = f"{float(price_raw):.2f}"
+                            except (TypeError, ValueError):
+                                price_text = '-'
+                            try:
+                                chg_text = f"{float(chg_raw):.2f}%"
+                            except (TypeError, ValueError):
+                                chg_text = '-'
+                            daily_lines.append(f"- {symbol} {name} 现价 {price_text}，涨跌幅 {chg_text}")
+                        _send_price_alert_notification(
+                            f"股票14:35价格播报 {today.isoformat()}",
+                            daily_lines,
+                        )
+                        daily_sent_day = today
+                except Exception:
+                    logger.exception('价格提醒线程执行异常')
+                time.sleep(PRICE_ALERT_INTERVAL)
+
+    thread = threading.Thread(target=_worker, name='PriceAlertWorker', daemon=True)
+    thread.start()
+    _PRICE_ALERT_THREAD_STARTED = True
 
 
 class User(UserMixin):
@@ -2739,6 +2998,15 @@ if os.environ.get('DISABLE_DAILY_SNAPSHOT_WORKER') != '1':
         should_start_worker = False
     if should_start_worker:
         _start_daily_snapshot_worker()
+
+if PRICE_ALERT_ENABLED:
+    should_start_price_alert = True
+    if app.debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        should_start_price_alert = False
+    if app.config.get('TESTING'):
+        should_start_price_alert = False
+    if should_start_price_alert:
+        _start_price_alert_worker()
 
 
 if __name__ == '__main__':
