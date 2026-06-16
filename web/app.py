@@ -1722,6 +1722,70 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
     }
 
 
+def _calculate_available_quantity_before_trade(
+    user_id: int,
+    symbol: str,
+    asset_type: str,
+    trade_date: str,
+    exclude_trade_id: Optional[int] = None,
+) -> float:
+    sql = (
+        'SELECT `id`, `trade_date`, `action`, `quantity` FROM `trade_logs` '
+        'WHERE `user_id` = %s AND `symbol` = %s AND `asset_type` = %s '
+        'ORDER BY `trade_date` ASC, `id` ASC'
+    )
+    rows = db_query_all(sql, (user_id, symbol, asset_type))
+    qty = 0.0
+    for row in rows:
+        if exclude_trade_id is not None and int(row['id']) == exclude_trade_id:
+            continue
+        row_date = _parse_iso_date(row['trade_date'])
+        candidate_date = _parse_iso_date(trade_date)
+        if candidate_date and row_date and row_date > candidate_date:
+            break
+        if (
+            exclude_trade_id is not None
+            and candidate_date
+            and row_date
+            and row_date == candidate_date
+            and int(row['id']) > exclude_trade_id
+        ):
+            continue
+        try:
+            trade_qty = float(row['quantity'] or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if row['action'] == 'buy':
+            qty += trade_qty
+        elif row['action'] == 'sell':
+            qty -= trade_qty
+    return max(qty, 0.0)
+
+
+def _validate_sell_quantity(
+    user_id: int,
+    symbol: str,
+    asset_type: str,
+    trade_date: str,
+    action: str,
+    quantity: float,
+    exclude_trade_id: Optional[int] = None,
+) -> bool:
+    if action != 'sell':
+        return True
+    available_qty = _calculate_available_quantity_before_trade(
+        user_id,
+        symbol,
+        asset_type,
+        trade_date,
+        exclude_trade_id=exclude_trade_id,
+    )
+    if quantity > available_qty + 1e-9:
+        flash(f'卖出数量不能大于当前持有数量。当前可卖：{available_qty:.2f}，本次卖出：{quantity:.2f}。', 'error')
+        return False
+    return True
+
+
 def _fetch_quotes_for_symbols(entries: List[tuple[str, str]]) -> Dict[str, dict]:
     if not entries:
         return {}
@@ -2480,6 +2544,9 @@ def trades_view():
             flash('印花税需为数字。', 'error')
             return redirect(url_for('trades_view'))
 
+        if not _validate_sell_quantity(current_user.id, symbol, asset_type, trade_date, action, quantity):
+            return redirect(url_for('trades_view'))
+
         db_execute(
             'INSERT INTO `trade_logs` (`user_id`, `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`) '
             'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
@@ -2601,6 +2668,9 @@ def edit_trade(trade_id: int):
             stamp_tax = float(stamp_raw) if stamp_raw else 0.0
         except ValueError:
             flash('印花税需为数字。', 'error')
+            return redirect(url_for('edit_trade', trade_id=trade_id))
+
+        if not _validate_sell_quantity(current_user.id, normalized_symbol, asset_type, trade_date, action, quantity, exclude_trade_id=trade_id):
             return redirect(url_for('edit_trade', trade_id=trade_id))
 
         db_execute(
