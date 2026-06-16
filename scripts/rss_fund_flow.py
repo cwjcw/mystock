@@ -3,6 +3,7 @@ import asyncio
 import time
 import json
 import re
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -15,6 +16,8 @@ DEFAULT_HEADERS = {
     "Referer": "https://quote.eastmoney.com/",
     "User-Agent": "Mozilla/5.0"
 }
+
+_TUSHARE_TOKEN_SET = False
 
 
 def _parse_date(text: Optional[str]) -> Optional[dt.date]:
@@ -34,6 +37,87 @@ def _parse_date(text: Optional[str]) -> Optional[dt.date]:
 def symbol_to_secid(symbol: str) -> str:
     code, exch = symbol.upper().split(".")
     return ("1." if exch == "SH" else "0.") + code
+
+
+def secid_to_stock_code(secid: str) -> Optional[str]:
+    try:
+        _market, code = secid.split(".", 1)
+    except ValueError:
+        return None
+    return code if len(code) == 6 and code.isdigit() else None
+
+
+def _load_env_file_for_tushare() -> None:
+    env_file = Path(__file__).resolve().parents[1] / ".env"
+    if not env_file.exists():
+        return
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def _ensure_tushare_token() -> None:
+    global _TUSHARE_TOKEN_SET
+    if _TUSHARE_TOKEN_SET:
+        return
+    _load_env_file_for_tushare()
+    token = os.environ.get("TUSHARE_TOKEN")
+    if token:
+        try:
+            import tushare as ts  # type: ignore
+
+            ts.set_token(token)
+        except Exception:
+            pass
+    _TUSHARE_TOKEN_SET = True
+
+
+def _to_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_quote_basic_tushare_sync(secid: str) -> Optional[dict]:
+    code = secid_to_stock_code(secid)
+    if not code:
+        return None
+    _ensure_tushare_token()
+    try:
+        import tushare as ts  # type: ignore
+
+        df = ts.get_realtime_quotes([code])
+    except Exception:
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    row = df.iloc[0]
+    price = _to_float(row.get("price"))
+    if price is None:
+        return None
+    pre_close = _to_float(row.get("pre_close"))
+    change_pct = None
+    if pre_close and abs(pre_close) > 1e-9:
+        change_pct = (price - pre_close) / pre_close * 100
+    name = row.get("name")
+    return {
+        "name": str(name).strip() if name is not None else None,
+        "price": price,
+        "change_pct": change_pct,
+        "market_cap": None,
+    }
+
+
+async def fetch_quote_basic_tushare(secid: str) -> Optional[dict]:
+    return await asyncio.to_thread(_fetch_quote_basic_tushare_sync, secid)
 
 
 def parse_kline_line(line: str):
@@ -85,7 +169,11 @@ async def fetch_latest_minute(session: aiohttp.ClientSession, secid: str) -> Tup
 
 
 async def fetch_quote_basic(session: aiohttp.ClientSession, secid: str) -> Optional[dict]:
-    """Fetch realtime quote basics: latest price, change pct, total mkt cap."""
+    """Fetch realtime quote basics, preferring Tushare for stock prices."""
+    tushare_quote = await fetch_quote_basic_tushare(secid)
+    if tushare_quote:
+        return tushare_quote
+
     url = "https://push2.eastmoney.com/api/qt/stock/get"
     params = {
         "secid": secid,
@@ -95,16 +183,62 @@ async def fetch_quote_basic(session: aiohttp.ClientSession, secid: str) -> Optio
     try:
         async with session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=10) as resp:
             if resp.status != 200:
-                return None
+                return await fetch_quote_basic_tencent(session, secid)
             j = await resp.json(content_type=None)
     except Exception:
-        return None
+        return await fetch_quote_basic_tencent(session, secid)
     d = (j or {}).get("data") or {}
+    if not d:
+        return await fetch_quote_basic_tencent(session, secid)
     price = (d.get("f43") or 0) / 100.0
     change_pct = (d.get("f170") or 0) / 100.0
     mcap = d.get("f116")  # RMB
     name = d.get("f58")
     return {"name": name, "price": price, "change_pct": change_pct, "market_cap": mcap}
+
+
+async def fetch_quote_basic_tencent(session: aiohttp.ClientSession, secid: str) -> Optional[dict]:
+    """Fetch realtime stock quote from Tencent as a fallback for Eastmoney outages."""
+    try:
+        market, code = secid.split(".", 1)
+    except ValueError:
+        return None
+    prefix = "sh" if market == "1" else "sz"
+    url = f"https://qt.gtimg.cn/q={prefix}{code}"
+    headers = {
+        "Referer": "https://gu.qq.com/",
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            text = await resp.text()
+    except Exception:
+        return None
+    if "=" not in text:
+        return None
+    payload = text.split("=", 1)[1].strip().strip('";')
+    parts = payload.split("~")
+
+    def to_float(idx: int) -> Optional[float]:
+        try:
+            value = parts[idx]
+        except IndexError:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    name = parts[1] if len(parts) > 1 else None
+    price = to_float(3)
+    change_pct = to_float(32)
+    market_cap_yi = to_float(45)
+    market_cap = None if market_cap_yi is None else market_cap_yi * 1e8
+    if price is None:
+        return None
+    return {"name": name, "price": price, "change_pct": change_pct, "market_cap": market_cap}
 
 
 async def fetch_fund_quote(session: aiohttp.ClientSession, code: str) -> Optional[dict]:

@@ -92,6 +92,9 @@ _RL_BUCKETS: dict[str, deque] = defaultdict(deque)
 _TRADING_CAL_CACHE: Optional[Set[str]] = None
 _TRADING_CAL_LAST_FETCH: Optional[float] = None
 _TRADING_CAL_TTL_SECONDS = 6 * 3600  # refresh trading calendar every 6 hours by default
+_STOCK_NAME_CACHE: Optional[Dict[str, str]] = None
+_STOCK_NAME_CACHE_LAST_FETCH: Optional[float] = None
+_STOCK_NAME_CACHE_TTL_SECONDS = 24 * 3600
 PRICE_ALERT_RULES_FILE = Path(os.environ.get('PRICE_ALERT_RULES_FILE', str(DATA_DIR / 'stock_price_alerts.txt')))
 PRICE_ALERT_INTERVAL = max(15, int(os.environ.get('PRICE_ALERT_INTERVAL', '30')))
 PRICE_ALERT_DAILY_HOUR = int(os.environ.get('PRICE_ALERT_DAILY_HOUR', '14'))
@@ -210,6 +213,7 @@ def init_db():
                     `user_id` INT NOT NULL,
                     `trade_date` DATE NOT NULL,
                     `symbol` VARCHAR(32) NOT NULL,
+                    `name` VARCHAR(255),
                     `action` VARCHAR(32) NOT NULL,
                     `quantity` DOUBLE NOT NULL,
                     `price` DOUBLE NOT NULL,
@@ -265,6 +269,8 @@ def init_db():
 
             cur.execute("SHOW COLUMNS FROM `trade_logs`")
             trade_cols = {row['Field'] for row in cur.fetchall()}
+            if 'name' not in trade_cols:
+                cur.execute("ALTER TABLE `trade_logs` ADD COLUMN `name` VARCHAR(255) AFTER `symbol`")
             if 'asset_type' not in trade_cols:
                 cur.execute("ALTER TABLE `trade_logs` ADD COLUMN `asset_type` VARCHAR(32) NOT NULL DEFAULT 'stock'")
             if 'stamp_tax' not in trade_cols:
@@ -1572,6 +1578,72 @@ def _normalize_trade_symbol(value: str, asset_type: str) -> str | None:
     return parsed[0]['symbol'] if parsed else None
 
 
+def _split_symbol_name_input(value: str) -> tuple[str, str]:
+    text = (value or '').strip()
+    if '=' not in text:
+        return '', text
+    name, symbol = text.split('=', 1)
+    return name.strip(), symbol.strip()
+
+
+def _watchlist_name_map(user_id: int, symbols: Optional[List[str]] = None) -> Dict[str, str]:
+    if symbols:
+        unique_symbols = sorted({sym for sym in symbols if sym})
+        if not unique_symbols:
+            return {}
+        placeholders = ','.join(['%s'] * len(unique_symbols))
+        rows = db_query_all(
+            f'SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s AND `symbol` IN ({placeholders})',
+            (user_id, *unique_symbols),
+        )
+    else:
+        rows = db_query_all(
+            'SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s',
+            (user_id,),
+        )
+    out: Dict[str, str] = {}
+    for row in rows:
+        symbol = row.get('symbol')
+        name = (row.get('name') or '').strip()
+        if symbol and name and name != symbol:
+            out[symbol] = name
+    return out
+
+
+def _stock_code_name_map(symbols: List[str]) -> Dict[str, str]:
+    stock_symbols = [sym for sym in symbols if sym and sym.upper().endswith(('.SH', '.SZ'))]
+    if not stock_symbols:
+        return {}
+    global _STOCK_NAME_CACHE, _STOCK_NAME_CACHE_LAST_FETCH
+    now_ts = time.time()
+    if (
+        _STOCK_NAME_CACHE is None
+        or _STOCK_NAME_CACHE_LAST_FETCH is None
+        or (now_ts - _STOCK_NAME_CACHE_LAST_FETCH) >= _STOCK_NAME_CACHE_TTL_SECONDS
+    ):
+        try:
+            import akshare as ak  # type: ignore
+
+            df = ak.stock_info_a_code_name()
+            _STOCK_NAME_CACHE = {
+                str(row['code']).zfill(6): str(row['name']).strip()
+                for _, row in df.iterrows()
+                if row.get('code') is not None and row.get('name') is not None
+            }
+            _STOCK_NAME_CACHE_LAST_FETCH = now_ts
+        except Exception as exc:  # pragma: no cover - network/cache failure path
+            logger.warning("无法刷新股票名称缓存: %s", exc)
+            return {}
+    cache = _STOCK_NAME_CACHE or {}
+    out: Dict[str, str] = {}
+    for sym in stock_symbols:
+        code = sym.split('.', 1)[0]
+        name = cache.get(code)
+        if name:
+            out[sym] = name
+    return out
+
+
 def _parse_iso_date(value: str | dt.date | dt.datetime | None) -> dt.date | None:
     if value is None or value == '':
         return None
@@ -1687,7 +1759,7 @@ def _fetch_quotes_for_symbols(entries: List[tuple[str, str]]) -> Dict[str, dict]
 
 def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date) -> dict:
     rows = db_query_all(
-        'SELECT `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type` '
+        'SELECT `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type` '
         'FROM `trade_logs` WHERE `user_id` = %s ORDER BY `trade_date` ASC, `id` ASC',
         (user_id,),
     )
@@ -1697,8 +1769,15 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         asset = (r['asset_type'] or 'stock') if 'asset_type' in r.keys() else 'stock'
         symbol_asset[r['symbol']] = asset
 
+    symbols_for_names = list(symbol_asset.keys())
     initial_quotes = _fetch_quotes_for_symbols(list(symbol_asset.items())) if symbol_asset else {}
-    name_cache = {sym: info.get('name') for sym, info in initial_quotes.items() if info.get('name')}
+    name_cache = _stock_code_name_map(symbols_for_names)
+    name_cache.update({sym: info.get('name') for sym, info in initial_quotes.items() if info.get('name')})
+    name_cache.update(_watchlist_name_map(user_id, symbols_for_names))
+    for row in rows:
+        trade_name = (row.get('name') or '').strip()
+        if trade_name:
+            name_cache[row['symbol']] = trade_name
 
     portfolio = _build_portfolio(rows, start_date, end_date, name_cache)
     holdings: Dict[str, dict] = portfolio['holdings']
@@ -1898,7 +1977,14 @@ def watchlist_view():
         'SELECT `symbol`, `name` FROM `watchlist` WHERE `user_id` = %s ORDER BY `id`',
         (current_user.id,),
     )
-    text = '\n'.join([f"{r['name']}={r['symbol']}" if r['name'] != r['symbol'] else r['symbol'] for r in rows])
+    fallback_names = _stock_code_name_map([r['symbol'] for r in rows])
+    text_lines = []
+    for r in rows:
+        symbol = r['symbol']
+        name = (r['name'] or '').strip()
+        display_name = name if name and name != symbol else fallback_names.get(symbol)
+        text_lines.append(f"{display_name}={symbol}" if display_name else symbol)
+    text = '\n'.join(text_lines)
     # Resolve prefix for display
     resolved_prefix = current_user.username if RSS_PREFIX == 'username' else RSS_PREFIX
     return render_template(
@@ -2348,7 +2434,9 @@ def trades_view():
     if request.method == 'POST':
         trade_date = request.form.get('trade_date', '').strip()
         symbol_input_raw = request.form.get('symbol', '')
-        symbol_input = symbol_input_raw.strip()
+        explicit_name = request.form.get('name', '').strip()
+        inline_name, symbol_input = _split_symbol_name_input(symbol_input_raw)
+        trade_name = explicit_name or inline_name
         action = request.form.get('action', '').strip().lower()
         quantity_raw = request.form.get('quantity', '').strip()
         price_raw = request.form.get('price', '').strip()
@@ -2393,9 +2481,9 @@ def trades_view():
             return redirect(url_for('trades_view'))
 
         db_execute(
-            'INSERT INTO `trade_logs` (`user_id`, `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`) '
-            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
-            (current_user.id, trade_date, symbol, action, quantity, price, fee, stamp_tax, asset_type, None),
+            'INSERT INTO `trade_logs` (`user_id`, `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+            (current_user.id, trade_date, symbol, trade_name or None, action, quantity, price, fee, stamp_tax, asset_type, None),
         )
         flash('已记录交易。', 'success')
         return redirect(url_for('trades_view'))
@@ -2416,7 +2504,7 @@ def trades_view():
         page = max_page
     offset = (page - 1) * per_page
     trades = db_query_all(
-        'SELECT `id`, `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`, `created_at` '
+        'SELECT `id`, `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`, `created_at` '
         'FROM `trade_logs` WHERE `user_id` = %s ORDER BY `trade_date` DESC, `id` DESC LIMIT %s OFFSET %s',
         (current_user.id, per_page, offset),
     )
@@ -2432,7 +2520,14 @@ def trades_view():
             seen.add(key)
             unique_entries.append(key)
         quotes = _fetch_quotes_for_symbols(unique_entries)
-        name_map = {sym: info.get('name') for sym, info in quotes.items() if info.get('name')}
+        trade_symbols = [row['symbol'] for row in trades]
+        name_map = _stock_code_name_map(trade_symbols)
+        name_map.update({sym: info.get('name') for sym, info in quotes.items() if info.get('name')})
+        name_map.update(_watchlist_name_map(current_user.id, trade_symbols))
+        for row in trades:
+            trade_name = (row.get('name') or '').strip()
+            if trade_name:
+                name_map[row['symbol']] = trade_name
 
     return render_template(
         'trades.html',
@@ -2447,7 +2542,7 @@ def trades_view():
 
 def _get_trade_or_404(trade_id: int):
     trade = db_query_one(
-        'SELECT `id`, `trade_date`, `symbol`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note` '
+        'SELECT `id`, `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note` '
         'FROM `trade_logs` WHERE `id` = %s AND `user_id` = %s',
         (trade_id, current_user.id),
     )
@@ -2463,7 +2558,9 @@ def edit_trade(trade_id: int):
     if request.method == 'POST':
         trade_date = request.form.get('trade_date', '').strip()
         symbol_input_raw = request.form.get('symbol', '')
-        symbol_input = symbol_input_raw.strip()
+        explicit_name = request.form.get('name', '').strip()
+        inline_name, symbol_input = _split_symbol_name_input(symbol_input_raw)
+        trade_name = explicit_name or inline_name
         action = request.form.get('action', '').strip().lower()
         quantity_raw = request.form.get('quantity', '').strip()
         price_raw = request.form.get('price', '').strip()
@@ -2507,9 +2604,9 @@ def edit_trade(trade_id: int):
             return redirect(url_for('edit_trade', trade_id=trade_id))
 
         db_execute(
-            'UPDATE `trade_logs` SET `trade_date`=%s, `symbol`=%s, `action`=%s, `quantity`=%s, `price`=%s, `fee`=%s, '
+            'UPDATE `trade_logs` SET `trade_date`=%s, `symbol`=%s, `name`=%s, `action`=%s, `quantity`=%s, `price`=%s, `fee`=%s, '
             '`stamp_tax`=%s, `asset_type`=%s, `note`=NULL WHERE `id`=%s AND `user_id`=%s',
-            (trade_date, normalized_symbol, action, quantity, price, fee, stamp_tax, asset_type, trade_id, current_user.id),
+            (trade_date, normalized_symbol, trade_name or None, action, quantity, price, fee, stamp_tax, asset_type, trade_id, current_user.id),
         )
         flash('已更新交易。', 'success')
         return redirect(url_for('trades_view'))

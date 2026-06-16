@@ -11,6 +11,10 @@
     <input id="symbol" name="symbol" type="text" value="{{ trade.symbol }}" required>
   </div>
   <div class="form-row">
+    <label for="name">名称</label>
+    <input id="name" name="name" type="text" value="{{ trade.name or '' }}" placeholder="可选">
+  </div>
+  <div class="form-row">
     <label for="asset_type">类别</label>
     <select id="asset_type" name="asset_type" required>
       <option value="stock" {% if trade.asset_type == 'stock' %}selected{% endif %}>股票</option>

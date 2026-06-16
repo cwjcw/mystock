@@ -11,7 +11,11 @@
     </div>
     <div class="form-row symbol-row">
       <label for="symbol">代码</label>
-      <input id="symbol" name="symbol" type="text" class="symbol-input" placeholder="000981 或 161725" required>
+      <input id="symbol" name="symbol" type="text" class="symbol-input" placeholder="000981 或 山子高科=000981" required>
+    </div>
+    <div class="form-row">
+      <label for="name">名称</label>
+      <input id="name" name="name" type="text" placeholder="可选">
     </div>
   <div class="form-row">
     <label for="asset_type">类别</label>
@@ -73,7 +77,7 @@
         {% for row in trades %}
           <tr>
             <td>{{ row.trade_date }}</td>
-            <td>{{ name_map.get(row.symbol) or '-' }}</td>
+            <td>{{ name_map.get(row.symbol) or row.name or row.symbol }}</td>
             <td>{{ '基金' if row.asset_type == 'fund' else '股票' }}</td>
           <td>
             {% if row.action == 'buy' %}买入{% elif row.action == 'sell' %}卖出{% else %}分红{% endif %}
@@ -83,6 +87,7 @@
             <td>{{ '%.2f'|format(row.fee or 0) }}</td>
             <td>{{ '%.2f'|format(row.stamp_tax or 0) }}</td>
             <td class="table-actions">
+              <a class="btn" href="{{ url_for('edit_trade', trade_id=row.id) }}">编辑</a>
               <form method="post" action="{{ url_for('delete_trade', trade_id=row.id) }}" onsubmit="return confirm('确认删除该记录？');">
                 <button class="btn" type="submit">删除</button>
               </form>
