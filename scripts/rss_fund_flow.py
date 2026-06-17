@@ -101,9 +101,11 @@ def _fetch_quote_basic_tushare_sync(secid: str) -> Optional[dict]:
         return None
     row = df.iloc[0]
     price = _to_float(row.get("price"))
-    if price is None:
-        return None
     pre_close = _to_float(row.get("pre_close"))
+    if price is None or price <= 0:
+        price = pre_close
+    if price is None or price <= 0:
+        return None
     change_pct = None
     if pre_close and abs(pre_close) > 1e-9:
         change_pct = (price - pre_close) / pre_close * 100

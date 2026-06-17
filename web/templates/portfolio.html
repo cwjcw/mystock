@@ -47,10 +47,10 @@
     </li>
     <li class="profit-item">
       <div class="profit-line">
-        <span class="profit-label">总盈亏</span>
+        <span class="profit-label">区间总收益</span>
         <span class="profit-value {{ 'profit-positive' if combined_total > 0 else 'profit-negative' if combined_total < 0 else '' }}">{{ '%.2f'|format(combined_total) }} 元</span>
       </div>
-      <div class="profit-extra">= 周期盈亏 + 持仓盈亏</div>
+      <div class="profit-extra">与周期盈亏一致，按期初/期末市值和期间现金流计算。</div>
     </li>
     <li class="profit-item">
       <div class="profit-line">
@@ -77,6 +77,34 @@
       </div>
     </li>
   </ul>
+</section>
+
+<section class="profit-breakdown">
+  <h3>盈利情况</h3>
+  <table class="profit-breakdown-table">
+    <thead>
+      <tr>
+        <th>维度</th>
+        <th>周期盈亏</th>
+        <th>持仓盈亏</th>
+        <th>当日盈亏</th>
+        <th>当前市值</th>
+        <th>当前成本</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in profit_summary_rows %}
+        <tr class="{{ 'summary-total' if item.asset_type == 'total' else '' }}">
+          <td>{{ item.label }}</td>
+          <td class="{{ 'profit-positive' if item.period_pnl > 0 else 'profit-negative' if item.period_pnl < 0 else '' }}">{{ '%.2f'|format(item.period_pnl) }}</td>
+          <td class="{{ 'profit-positive' if item.unrealized > 0 else 'profit-negative' if item.unrealized < 0 else '' }}">{{ '%.2f'|format(item.unrealized) }}</td>
+          <td class="{{ 'profit-positive' if item.daily_pnl > 0 else 'profit-negative' if item.daily_pnl < 0 else '' }}">{{ '%.2f'|format(item.daily_pnl) }}</td>
+          <td>{{ '%.2f'|format(item.market_value) }}</td>
+          <td>{{ '%.2f'|format(item.cost_basis) }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 </section>
 
 <section class="positions">

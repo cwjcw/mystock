@@ -1783,14 +1783,16 @@ def _build_quantity_positions_until(rows, cutoff_date: dt.date) -> Dict[str, dic
     return {sym: data for sym, data in positions.items() if data['quantity'] > 1e-9}
 
 
-def _value_positions_at_date(positions: Dict[str, dict], value_date: dt.date, latest_quotes: Dict[str, dict]) -> float:
-    total = 0.0
+def _value_positions_at_date_by_asset(positions: Dict[str, dict], value_date: dt.date, latest_quotes: Dict[str, dict]) -> Dict[str, float]:
+    totals = {'stock': 0.0, 'fund': 0.0}
     today = dt.datetime.now(CHINA_TZ).date()
     for symbol, data in positions.items():
         quantity = float(data.get('quantity') or 0.0)
         if quantity <= 0:
             continue
         asset_type = data.get('asset_type') or 'stock'
+        if asset_type not in totals:
+            totals[asset_type] = 0.0
         price = None
         if value_date >= today:
             price = (latest_quotes.get(symbol) or {}).get('price')
@@ -1800,8 +1802,12 @@ def _value_positions_at_date(positions: Dict[str, dict], value_date: dt.date, la
             price = (latest_quotes.get(symbol) or {}).get('price')
         if price is None:
             continue
-        total += quantity * float(price)
-    return total
+        totals[asset_type] += quantity * float(price)
+    return totals
+
+
+def _value_positions_at_date(positions: Dict[str, dict], value_date: dt.date, latest_quotes: Dict[str, dict]) -> float:
+    return sum(_value_positions_at_date_by_asset(positions, value_date, latest_quotes).values())
 
 
 def _calculate_period_pnl_by_nav(
@@ -1813,11 +1819,29 @@ def _calculate_period_pnl_by_nav(
     previous_day = start_date - dt.timedelta(days=1)
     start_positions = _build_quantity_positions_until(rows, previous_day)
     end_positions = _build_quantity_positions_until(rows, end_date)
-    start_value = _value_positions_at_date(start_positions, previous_day, latest_quotes)
-    end_value = _value_positions_at_date(end_positions, end_date, latest_quotes)
+    start_values = _value_positions_at_date_by_asset(start_positions, previous_day, latest_quotes)
+    end_values = _value_positions_at_date_by_asset(end_positions, end_date, latest_quotes)
+    start_value = sum(start_values.values())
+    end_value = sum(end_values.values())
     buy_cost = 0.0
     sell_proceeds = 0.0
     dividend_income = 0.0
+    by_asset = {
+        'stock': {
+            'period_start_value': start_values.get('stock', 0.0),
+            'period_end_value': end_values.get('stock', 0.0),
+            'period_buy_cost': 0.0,
+            'period_sell_proceeds': 0.0,
+            'period_dividend_income': 0.0,
+        },
+        'fund': {
+            'period_start_value': start_values.get('fund', 0.0),
+            'period_end_value': end_values.get('fund', 0.0),
+            'period_buy_cost': 0.0,
+            'period_sell_proceeds': 0.0,
+            'period_dividend_income': 0.0,
+        },
+    }
     for row in rows:
         trade_day = _parse_iso_date(row['trade_date'])
         if not trade_day or trade_day < start_date or trade_day > end_date:
@@ -1830,12 +1854,35 @@ def _calculate_period_pnl_by_nav(
         except (TypeError, ValueError):
             continue
         amount = quantity * price
+        asset_type = row.get('asset_type') or 'stock'
+        if asset_type not in by_asset:
+            by_asset[asset_type] = {
+                'period_start_value': start_values.get(asset_type, 0.0),
+                'period_end_value': end_values.get(asset_type, 0.0),
+                'period_buy_cost': 0.0,
+                'period_sell_proceeds': 0.0,
+                'period_dividend_income': 0.0,
+            }
         if row['action'] == 'buy':
-            buy_cost += amount + fee + stamp_tax
+            value = amount + fee + stamp_tax
+            buy_cost += value
+            by_asset[asset_type]['period_buy_cost'] += value
         elif row['action'] == 'sell':
-            sell_proceeds += amount - fee - stamp_tax
+            value = amount - fee - stamp_tax
+            sell_proceeds += value
+            by_asset[asset_type]['period_sell_proceeds'] += value
         elif row['action'] == 'dividend':
-            dividend_income += amount - fee - stamp_tax
+            value = amount - fee - stamp_tax
+            dividend_income += value
+            by_asset[asset_type]['period_dividend_income'] += value
+    for data in by_asset.values():
+        data['period_pnl'] = (
+            data['period_end_value']
+            + data['period_sell_proceeds']
+            + data['period_dividend_income']
+            - data['period_start_value']
+            - data['period_buy_cost']
+        )
     period_pnl = end_value + sell_proceeds + dividend_income - start_value - buy_cost
     return {
         'period_pnl': period_pnl,
@@ -1844,6 +1891,7 @@ def _calculate_period_pnl_by_nav(
         'period_buy_cost': buy_cost,
         'period_sell_proceeds': sell_proceeds,
         'period_dividend_income': dividend_income,
+        'by_asset': by_asset,
     }
 
 
@@ -1982,6 +2030,10 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
     unrealized_total = 0.0
     daily_stock_pnl = 0.0
     daily_fund_pnl = 0.0
+    current_by_asset = {
+        'stock': {'market_value': 0.0, 'cost_basis': 0.0, 'unrealized': 0.0, 'daily_pnl': 0.0},
+        'fund': {'market_value': 0.0, 'cost_basis': 0.0, 'unrealized': 0.0, 'daily_pnl': 0.0},
+    }
 
     for sym in symbols:
         data = holdings[sym]
@@ -2010,6 +2062,15 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         if unrealized is not None:
             unrealized_total += unrealized
         asset_type_val = data.get('asset_type', 'stock')
+        if asset_type_val not in current_by_asset:
+            current_by_asset[asset_type_val] = {'market_value': 0.0, 'cost_basis': 0.0, 'unrealized': 0.0, 'daily_pnl': 0.0}
+        current_by_asset[asset_type_val]['cost_basis'] += cost_basis
+        if market_value is not None:
+            current_by_asset[asset_type_val]['market_value'] += market_value
+        if unrealized is not None:
+            current_by_asset[asset_type_val]['unrealized'] += unrealized
+        if daily_change is not None:
+            current_by_asset[asset_type_val]['daily_pnl'] += daily_change
         if asset_type_val == 'stock' and daily_change is not None:
             daily_stock_pnl += daily_change
         if asset_type_val == 'fund' and daily_change is not None:
@@ -2047,8 +2108,40 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
 
     period_performance = _calculate_period_pnl_by_nav(rows, start_date, end_date, initial_quotes)
     realized_with_initial = period_performance['period_pnl'] + initial_period_total
-    combined_total = realized_with_initial + unrealized_total
+    combined_total = realized_with_initial
     daily_total = daily_stock_pnl + daily_fund_pnl
+    period_by_asset = period_performance.get('by_asset', {})
+    profit_summary_rows = []
+    for asset_key, label in (('stock', '股票'), ('fund', '基金')):
+        period_values = period_by_asset.get(asset_key) or {}
+        current_values = current_by_asset.get(asset_key) or {}
+        market_value = current_values.get('market_value', 0.0) or period_values.get('period_end_value', 0.0)
+        cost_value = current_values.get('cost_basis', 0.0)
+        unrealized_value = current_values.get('unrealized', 0.0)
+        if abs(unrealized_value) < 1e-9 and market_value and cost_value:
+            unrealized_value = market_value - cost_value
+        profit_summary_rows.append(
+            {
+                'asset_type': asset_key,
+                'label': label,
+                'period_pnl': period_values.get('period_pnl', 0.0),
+                'unrealized': unrealized_value,
+                'daily_pnl': current_values.get('daily_pnl', 0.0),
+                'market_value': market_value,
+                'cost_basis': cost_value,
+            }
+        )
+    profit_summary_rows.append(
+        {
+            'asset_type': 'total',
+            'label': '合计',
+            'period_pnl': realized_with_initial,
+            'unrealized': sum(row['unrealized'] for row in profit_summary_rows),
+            'daily_pnl': sum(row['daily_pnl'] for row in profit_summary_rows),
+            'market_value': sum(row['market_value'] for row in profit_summary_rows),
+            'cost_basis': sum(row['cost_basis'] for row in profit_summary_rows),
+        }
+    )
     base_for_daily_ratio = total_market_value if abs(total_market_value) > 1e-9 else total_cost_basis
     daily_ratio = None
     if base_for_daily_ratio and abs(base_for_daily_ratio) > 1e-9:
@@ -2069,6 +2162,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'total_market_value': total_market_value,
         'total_cost_basis': total_cost_basis,
         'combined_total': combined_total,
+        'profit_summary_rows': profit_summary_rows,
         'daily_stock_pnl': daily_stock_pnl,
         'daily_fund_pnl': daily_fund_pnl,
         'daily_total': daily_total,
@@ -2886,6 +2980,7 @@ def portfolio_view():
         total_market_value=context['total_market_value'],
         total_cost_basis=context['total_cost_basis'],
         combined_total=context['combined_total'],
+        profit_summary_rows=context['profit_summary_rows'],
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
         initial_period_total=context['initial_period_total'],
