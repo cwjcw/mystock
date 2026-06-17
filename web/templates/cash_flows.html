@@ -1,0 +1,123 @@
+{% extends 'layout.html' %}
+{% block content %}
+<header class="portfolio-hero">
+  <div>
+    <p class="eyebrow">Cash ledger</p>
+    <h2>资金流水</h2>
+    <p class="hero-subtitle">现金 = 手工入金/出金 + 交易自动现金流。卖出自动增加现金，买入自动扣减现金。</p>
+  </div>
+</header>
+
+<section class="profit-overview">
+  <ul class="profit-list cash-summary-list">
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">当前现金</span>
+        <span class="profit-value {{ 'profit-positive' if ledger.cash_balance > 0 else 'profit-negative' if ledger.cash_balance < 0 else '' }}">{{ '%.2f'|format(ledger.cash_balance) }} 元</span>
+      </div>
+      <div class="profit-extra">
+        <div>手工资金合计：{{ '%.2f'|format(ledger.manual_total) }} 元</div>
+        <div>交易自动现金流：{{ '%.2f'|format(ledger.trade_total) }} 元</div>
+      </div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">手工入金</span>
+        <span class="profit-value profit-positive">{{ '%.2f'|format(ledger.deposit_total) }} 元</span>
+      </div>
+      <div class="profit-extra">补录历史入金后，期末现金和总资产会同步修正。</div>
+    </li>
+    <li class="profit-item">
+      <div class="profit-line">
+        <span class="profit-label">手工出金</span>
+        <span class="profit-value profit-negative">{{ '%.2f'|format(ledger.withdraw_total) }} 元</span>
+      </div>
+      <div class="profit-extra">提现/转出会减少现金，并作为净转入资金的一部分影响周期盈亏。</div>
+    </li>
+  </ul>
+</section>
+
+<section class="cash-flows panel-card">
+  <h3>录入入金/出金</h3>
+  <form method="post" action="{{ url_for('cash_flows_view') }}" class="cash-flow-form">
+    <div class="form-row">
+      <label for="flow_date">日期</label>
+      <input id="flow_date" name="flow_date" type="date" value="{{ today_str }}" required>
+    </div>
+    <div class="form-row">
+      <label for="flow_type">类型</label>
+      <select id="flow_type" name="flow_type" required>
+        <option value="deposit">入金</option>
+        <option value="withdraw">出金</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="flow_amount">金额</label>
+      <input id="flow_amount" name="amount" type="number" step="0.01" min="0" required>
+    </div>
+    <div class="form-row">
+      <label for="flow_note">备注</label>
+      <input id="flow_note" name="note" type="text" placeholder="可选">
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">保存</button>
+    </div>
+  </form>
+</section>
+
+<section class="cash-flows panel-card">
+  <h3>流水明细</h3>
+  <form method="get" class="pnl-form range">
+    <div class="form-row">
+      <label for="start">开始日期</label>
+      <input id="start" name="start" type="date" value="{{ start_date }}">
+    </div>
+    <div class="form-row">
+      <label for="end">结束日期</label>
+      <input id="end" name="end" type="date" value="{{ end_date }}">
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">筛选</button>
+      <a class="btn" href="{{ url_for('cash_flows_view') }}">重置</a>
+    </div>
+  </form>
+  <table class="cash-flow-table ledger-table">
+    <thead>
+      <tr>
+        <th>日期</th>
+        <th>来源</th>
+        <th>类型</th>
+        <th>标的</th>
+        <th>金额</th>
+        <th>备注</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for event in ledger.events %}
+        <tr>
+          <td>{{ event.date }}</td>
+          <td>{{ event.source_label }}</td>
+          <td>{{ event.type_label }}</td>
+          <td>{% if event.symbol %}{{ event.name or event.symbol }} <span class="position-symbol">{{ event.symbol }}</span>{% else %}-{% endif %}</td>
+          <td class="{{ 'profit-positive' if event.amount > 0 else 'profit-negative' if event.amount < 0 else '' }}">{{ '%.2f'|format(event.amount) }}</td>
+          <td>{{ event.note }}</td>
+          <td>
+            {% if event.source == 'manual' %}
+              <form method="post" action="{{ url_for('delete_cash_flow', flow_id=event.flow_id) }}" onsubmit="return confirm('确认删除该资金流水？');">
+                <button class="btn" type="submit">删除</button>
+              </form>
+            {% else %}
+              自动
+            {% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr>
+          <td colspan="7">暂无资金流水。</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

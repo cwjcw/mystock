@@ -5,6 +5,8 @@ import time
 import threading
 import math
 import logging
+import json
+import re
 from functools import wraps
 from collections import defaultdict, deque
 from pathlib import Path
@@ -229,19 +231,6 @@ def init_db():
             )
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS `initial_profits` (
-                    `id` INT AUTO_INCREMENT PRIMARY KEY,
-                    `user_id` INT NOT NULL,
-                    `profit_date` DATE NOT NULL,
-                    `amount` DOUBLE NOT NULL,
-                    `note` TEXT,
-                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT `fk_initial_profit_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            cur.execute(
-                """
                 CREATE TABLE IF NOT EXISTS `daily_profit_snapshots` (
                     `id` INT AUTO_INCREMENT PRIMARY KEY,
                     `user_id` INT NOT NULL,
@@ -253,6 +242,48 @@ def init_db():
                     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     UNIQUE KEY `uniq_user_date` (`user_id`, `snapshot_date`),
                     CONSTRAINT `fk_daily_profit_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `account_cash_flows` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `user_id` INT NOT NULL,
+                    `flow_date` DATE NOT NULL,
+                    `amount` DOUBLE NOT NULL,
+                    `note` VARCHAR(255),
+                    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_cash_user_date` (`user_id`, `flow_date`),
+                    CONSTRAINT `fk_account_cash_user` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `stock_daily_prices` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `symbol` VARCHAR(32) NOT NULL,
+                    `trade_date` DATE NOT NULL,
+                    `close` DOUBLE NOT NULL,
+                    `source` VARCHAR(32) NOT NULL DEFAULT 'tushare',
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uniq_symbol_trade_date` (`symbol`, `trade_date`),
+                    INDEX `idx_symbol_date` (`symbol`, `trade_date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `fund_daily_prices` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `symbol` VARCHAR(32) NOT NULL,
+                    `trade_date` DATE NOT NULL,
+                    `nav` DOUBLE NOT NULL,
+                    `source` VARCHAR(32) NOT NULL DEFAULT 'eastmoney',
+                    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY `uniq_fund_symbol_trade_date` (`symbol`, `trade_date`),
+                    INDEX `idx_fund_symbol_date` (`symbol`, `trade_date`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
@@ -429,6 +460,7 @@ login_manager.login_view = 'login'
 
 _FUND_SETTLEMENT_THREAD_STARTED = False
 _PRICE_ALERT_THREAD_STARTED = False
+_DAILY_PRICE_CACHE_THREAD_STARTED = False
 
 
 def _start_fund_settlement_thread():
@@ -1723,6 +1755,241 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
     }
 
 
+def _cached_stock_close_on_or_before(symbol: str, target_date: dt.date) -> Optional[float]:
+    row = db_query_one(
+        'SELECT `close` FROM `stock_daily_prices` '
+        'WHERE `symbol` = %s AND `trade_date` <= %s '
+        'ORDER BY `trade_date` DESC LIMIT 1',
+        (symbol, target_date),
+    )
+    if row and row['close'] is not None:
+        return float(row['close'])
+    return None
+
+
+def _cache_tushare_daily_prices(symbol: str, start_date: dt.date, end_date: dt.date) -> None:
+    token = os.environ.get('TUSHARE_TOKEN')
+    if not token:
+        return
+    try:
+        import tushare as ts  # type: ignore
+
+        ts.set_token(token)
+        pro = ts.pro_api()
+        df = pro.daily(
+            ts_code=symbol,
+            start_date=start_date.strftime('%Y%m%d'),
+            end_date=end_date.strftime('%Y%m%d'),
+        )
+    except Exception as exc:
+        logger.warning('从 Tushare 拉取日线失败 %s %s-%s: %s', symbol, start_date, end_date, exc)
+        return
+    if df is None or df.empty or 'trade_date' not in df or 'close' not in df:
+        return
+
+    params = []
+    for _, row in df.iterrows():
+        trade_date = _parse_iso_date(str(row.get('trade_date', '')))
+        if trade_date is None:
+            raw_date = str(row.get('trade_date', '')).strip()
+            if len(raw_date) == 8 and raw_date.isdigit():
+                try:
+                    trade_date = dt.datetime.strptime(raw_date, '%Y%m%d').date()
+                except ValueError:
+                    trade_date = None
+        if trade_date is None:
+            continue
+        try:
+            close = float(row['close'])
+        except (TypeError, ValueError):
+            continue
+        if close <= 0:
+            continue
+        params.append((symbol, trade_date, close, 'tushare'))
+    if not params:
+        return
+    db_executemany(
+        'INSERT INTO `stock_daily_prices` (`symbol`, `trade_date`, `close`, `source`) '
+        'VALUES (%s, %s, %s, %s) '
+        'ON DUPLICATE KEY UPDATE `close` = VALUES(`close`), `source` = VALUES(`source`)',
+        params,
+    )
+
+
+def _cached_fund_nav_on_or_before(symbol: str, target_date: dt.date) -> Optional[float]:
+    row = db_query_one(
+        'SELECT `nav` FROM `fund_daily_prices` '
+        'WHERE `symbol` = %s AND `trade_date` <= %s '
+        'ORDER BY `trade_date` DESC LIMIT 1',
+        (symbol, target_date),
+    )
+    if row and row['nav'] is not None:
+        return float(row['nav'])
+    return None
+
+
+def _cache_eastmoney_fund_daily_prices(symbol: str, start_date: dt.date, end_date: dt.date) -> None:
+    base = symbol.upper().split('.', 1)[0]
+    if not base.isdigit():
+        return
+    url = f'https://fund.eastmoney.com/pingzhongdata/{base}.js'
+    headers = {
+        'Referer': 'https://fund.eastmoney.com/',
+        'User-Agent': 'Mozilla/5.0',
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=12)
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.warning('从东方财富拉取基金净值失败 %s %s-%s: %s', symbol, start_date, end_date, exc)
+        return
+    match = re.search(r"var Data_netWorthTrend\s*=\s*(\[.*?\]);", resp.text)
+    if not match:
+        return
+    try:
+        trend = json.loads(match.group(1))
+    except Exception as exc:
+        logger.warning('解析基金净值失败 %s: %s', symbol, exc)
+        return
+    params = []
+    for item in trend:
+        try:
+            trade_date = dt.datetime.fromtimestamp(int(item.get('x', 0)) / 1000, tz=CHINA_TZ).date()
+            nav = float(item.get('y'))
+        except (TypeError, ValueError, OSError):
+            continue
+        if trade_date < start_date or trade_date > end_date or nav <= 0:
+            continue
+        params.append((symbol, trade_date, nav, 'eastmoney'))
+    if not params:
+        return
+    db_executemany(
+        'INSERT INTO `fund_daily_prices` (`symbol`, `trade_date`, `nav`, `source`) '
+        'VALUES (%s, %s, %s, %s) '
+        'ON DUPLICATE KEY UPDATE `nav` = VALUES(`nav`), `source` = VALUES(`source`)',
+        params,
+    )
+
+
+def _trade_asset_price_ranges(asset_type: str, user_id: Optional[int] = None) -> List[Dict]:
+    sql = (
+        'SELECT `symbol`, MIN(`trade_date`) AS first_trade_date '
+        'FROM `trade_logs` WHERE `asset_type` = %s '
+    )
+    params: list = [asset_type]
+    if user_id is not None:
+        sql += 'AND `user_id` = %s '
+        params.append(user_id)
+    sql += 'GROUP BY `symbol` ORDER BY `symbol`'
+    return db_query_all(sql, tuple(params))
+
+
+def _refresh_stock_daily_prices_for_symbol(user_id: int, symbol: str) -> None:
+    if not symbol.upper().endswith(('.SH', '.SZ')):
+        return
+    row = db_query_one(
+        'SELECT MIN(`trade_date`) AS first_trade_date FROM `trade_logs` '
+        'WHERE `user_id` = %s AND `symbol` = %s AND `asset_type` = %s',
+        (user_id, symbol, 'stock'),
+    )
+    first_trade_date = _parse_iso_date(row['first_trade_date'] if row else None)
+    if first_trade_date is None:
+        return
+    today = dt.datetime.now(CHINA_TZ).date()
+    _cache_tushare_daily_prices(symbol, first_trade_date, today)
+
+
+def _refresh_fund_daily_prices_for_symbol(user_id: int, symbol: str) -> None:
+    if not symbol.upper().endswith('.OF'):
+        return
+    row = db_query_one(
+        'SELECT MIN(`trade_date`) AS first_trade_date FROM `trade_logs` '
+        'WHERE `user_id` = %s AND `symbol` = %s AND `asset_type` = %s',
+        (user_id, symbol, 'fund'),
+    )
+    first_trade_date = _parse_iso_date(row['first_trade_date'] if row else None)
+    if first_trade_date is None:
+        return
+    today = dt.datetime.now(CHINA_TZ).date()
+    _cache_eastmoney_fund_daily_prices(symbol, first_trade_date, today)
+
+
+def _refresh_all_traded_stock_daily_prices(user_id: Optional[int] = None) -> int:
+    today = dt.datetime.now(CHINA_TZ).date()
+    count = 0
+    for row in _trade_asset_price_ranges('stock', user_id):
+        symbol = row.get('symbol')
+        first_trade_date = _parse_iso_date(row.get('first_trade_date'))
+        if not symbol or first_trade_date is None:
+            continue
+        _cache_tushare_daily_prices(symbol, first_trade_date, today)
+        count += 1
+    return count
+
+
+def _refresh_all_traded_fund_daily_prices(user_id: Optional[int] = None) -> int:
+    today = dt.datetime.now(CHINA_TZ).date()
+    count = 0
+    for row in _trade_asset_price_ranges('fund', user_id):
+        symbol = row.get('symbol')
+        first_trade_date = _parse_iso_date(row.get('first_trade_date'))
+        if not symbol or first_trade_date is None:
+            continue
+        _cache_eastmoney_fund_daily_prices(symbol, first_trade_date, today)
+        count += 1
+    return count
+
+
+def _start_trade_price_refresh(user_id: int, symbol: str, asset_type: str) -> None:
+    if asset_type == 'stock' and not symbol.upper().endswith(('.SH', '.SZ')):
+        return
+    if asset_type == 'fund' and not symbol.upper().endswith('.OF'):
+        return
+    if asset_type not in {'stock', 'fund'}:
+        return
+
+    def _worker() -> None:
+        try:
+            with app.app_context():
+                if asset_type == 'stock':
+                    _refresh_stock_daily_prices_for_symbol(user_id, symbol)
+                else:
+                    _refresh_fund_daily_prices_for_symbol(user_id, symbol)
+        except Exception:
+            app.logger.exception('补齐 %s 的历史价格缓存失败', symbol)
+
+    threading.Thread(target=_worker, name=f'PriceRefresh-{asset_type}-{symbol}', daemon=True).start()
+
+
+def _start_daily_price_cache_worker() -> None:
+    global _DAILY_PRICE_CACHE_THREAD_STARTED
+    if _DAILY_PRICE_CACHE_THREAD_STARTED:
+        return
+
+    def _worker() -> None:
+        last_refreshed: Optional[dt.date] = None
+        interval = max(300, int(os.environ.get('DAILY_PRICE_CACHE_INTERVAL', '900')))
+        refresh_hour = int(os.environ.get('DAILY_PRICE_CACHE_HOUR', '16'))
+        refresh_minute = int(os.environ.get('DAILY_PRICE_CACHE_MINUTE', '30'))
+        while True:
+            now = dt.datetime.now(CHINA_TZ)
+            refresh_time = now.replace(hour=refresh_hour, minute=refresh_minute, second=0, microsecond=0)
+            if now >= refresh_time and last_refreshed != now.date():
+                try:
+                    with app.app_context():
+                        if _is_trading_day(now.date()):
+                            stock_updated = _refresh_all_traded_stock_daily_prices()
+                            fund_updated = _refresh_all_traded_fund_daily_prices()
+                            app.logger.info('已更新 %s 个股票、%s 个基金的历史价格缓存。', stock_updated, fund_updated)
+                        last_refreshed = now.date()
+                except Exception:
+                    app.logger.exception('每日历史价格缓存更新失败')
+            time.sleep(interval)
+
+    threading.Thread(target=_worker, name='DailyPriceCacheWorker', daemon=True).start()
+    _DAILY_PRICE_CACHE_THREAD_STARTED = True
+
+
 def _fetch_stock_close_on_or_before(symbol: str, target_date: dt.date) -> Optional[float]:
     key = (symbol, target_date)
     if key in _HISTORICAL_PRICE_CACHE:
@@ -1730,35 +1997,28 @@ def _fetch_stock_close_on_or_before(symbol: str, target_date: dt.date) -> Option
     if not symbol.upper().endswith(('.SH', '.SZ')):
         _HISTORICAL_PRICE_CACHE[key] = None
         return None
-    token = os.environ.get('TUSHARE_TOKEN')
-    if not token:
-        _HISTORICAL_PRICE_CACHE[key] = None
-        return None
-    try:
-        import tushare as ts  # type: ignore
 
-        ts.set_token(token)
-        pro = ts.pro_api()
-        start = target_date - dt.timedelta(days=20)
-        df = pro.daily(
-            ts_code=symbol,
-            start_date=start.strftime('%Y%m%d'),
-            end_date=target_date.strftime('%Y%m%d'),
-        )
-    except Exception as exc:
-        logger.warning('获取历史收盘价失败 %s %s: %s', symbol, target_date, exc)
-        _HISTORICAL_PRICE_CACHE[key] = None
-        return None
-    if df is None or df.empty or 'close' not in df:
-        _HISTORICAL_PRICE_CACHE[key] = None
-        return None
-    try:
-        df = df.sort_values('trade_date')
-        close = float(df.iloc[-1]['close'])
-    except Exception:
-        close = None
+    close = _cached_stock_close_on_or_before(symbol, target_date)
+    if close is None:
+        _cache_tushare_daily_prices(symbol, target_date - dt.timedelta(days=90), target_date)
+        close = _cached_stock_close_on_or_before(symbol, target_date)
     _HISTORICAL_PRICE_CACHE[key] = close
     return close
+
+
+def _fetch_fund_nav_on_or_before(symbol: str, target_date: dt.date) -> Optional[float]:
+    key = (symbol, target_date)
+    if key in _HISTORICAL_PRICE_CACHE:
+        return _HISTORICAL_PRICE_CACHE[key]
+    if not symbol.upper().endswith('.OF'):
+        _HISTORICAL_PRICE_CACHE[key] = None
+        return None
+    nav = _cached_fund_nav_on_or_before(symbol, target_date)
+    if nav is None:
+        _cache_eastmoney_fund_daily_prices(symbol, target_date - dt.timedelta(days=365), target_date)
+        nav = _cached_fund_nav_on_or_before(symbol, target_date)
+    _HISTORICAL_PRICE_CACHE[key] = nav
+    return nav
 
 
 def _build_quantity_positions_until(rows, cutoff_date: dt.date) -> Dict[str, dict]:
@@ -1798,6 +2058,8 @@ def _value_positions_at_date_by_asset(positions: Dict[str, dict], value_date: dt
             price = (latest_quotes.get(symbol) or {}).get('price')
         if price is None and asset_type == 'stock':
             price = _fetch_stock_close_on_or_before(symbol, value_date)
+        if price is None and asset_type == 'fund':
+            price = _fetch_fund_nav_on_or_before(symbol, value_date)
         if price is None:
             price = (latest_quotes.get(symbol) or {}).get('price')
         if price is None:
@@ -1810,7 +2072,173 @@ def _value_positions_at_date(positions: Dict[str, dict], value_date: dt.date, la
     return sum(_value_positions_at_date_by_asset(positions, value_date, latest_quotes).values())
 
 
+def _trade_cash_effect(row) -> float:
+    try:
+        quantity = float(row['quantity'] or 0.0)
+        price = float(row['price'] or 0.0)
+        fee = float(row['fee'] or 0.0)
+        stamp_tax = float(row['stamp_tax'] or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+    amount = quantity * price
+    if row['action'] == 'buy':
+        return -(amount + fee + stamp_tax)
+    if row['action'] == 'sell':
+        return amount - fee - stamp_tax
+    if row['action'] == 'dividend':
+        return amount - fee - stamp_tax
+    return 0.0
+
+
+def _trade_cash_until(rows, cutoff_date: dt.date) -> float:
+    total = 0.0
+    for row in rows:
+        trade_day = _parse_iso_date(row['trade_date'])
+        if trade_day and trade_day <= cutoff_date:
+            total += _trade_cash_effect(row)
+    return total
+
+
+def _account_cash_flow_sum(user_id: int, start_date: Optional[dt.date], end_date: dt.date) -> float:
+    if start_date is None:
+        row = db_query_one(
+            'SELECT COALESCE(SUM(`amount`), 0) AS total FROM `account_cash_flows` '
+            'WHERE `user_id` = %s AND `flow_date` <= %s',
+            (user_id, end_date),
+        )
+    else:
+        row = db_query_one(
+            'SELECT COALESCE(SUM(`amount`), 0) AS total FROM `account_cash_flows` '
+            'WHERE `user_id` = %s AND `flow_date` >= %s AND `flow_date` <= %s',
+            (user_id, start_date, end_date),
+        )
+    if row and row['total'] is not None:
+        return float(row['total'])
+    return 0.0
+
+
+def _account_cash_flow_totals(user_id: int, start_date: dt.date, end_date: dt.date) -> Dict[str, float]:
+    rows = db_query_all(
+        'SELECT `amount` FROM `account_cash_flows` '
+        'WHERE `user_id` = %s AND `flow_date` >= %s AND `flow_date` <= %s',
+        (user_id, start_date, end_date),
+    )
+    deposits = 0.0
+    withdrawals = 0.0
+    for row in rows:
+        amount = float(row['amount'] or 0.0)
+        if amount >= 0:
+            deposits += amount
+        else:
+            withdrawals += -amount
+    return {
+        'deposits': deposits,
+        'withdrawals': withdrawals,
+        'net_transfer': deposits - withdrawals,
+    }
+
+
+def _account_cash_until(user_id: int, rows, cutoff_date: dt.date) -> float:
+    return _account_cash_flow_sum(user_id, None, cutoff_date) + _trade_cash_until(rows, cutoff_date)
+
+
+def _recent_account_cash_flows(user_id: int, limit: int = 20):
+    return db_query_all(
+        'SELECT `id`, `flow_date`, `amount`, `note`, `created_at` FROM `account_cash_flows` '
+        'WHERE `user_id` = %s ORDER BY `flow_date` DESC, `id` DESC LIMIT %s',
+        (user_id, limit),
+    )
+
+
+def _cash_flow_ledger(user_id: int, start_date: Optional[dt.date] = None, end_date: Optional[dt.date] = None) -> Dict:
+    where_manual = ['`user_id` = %s']
+    manual_params: List = [user_id]
+    where_trade = ['`user_id` = %s']
+    trade_params: List = [user_id]
+    if start_date:
+        where_manual.append('`flow_date` >= %s')
+        manual_params.append(start_date)
+        where_trade.append('`trade_date` >= %s')
+        trade_params.append(start_date)
+    if end_date:
+        where_manual.append('`flow_date` <= %s')
+        manual_params.append(end_date)
+        where_trade.append('`trade_date` <= %s')
+        trade_params.append(end_date)
+
+    manual_rows = db_query_all(
+        'SELECT `id`, `flow_date`, `amount`, `note`, `created_at` FROM `account_cash_flows` '
+        f'WHERE {" AND ".join(where_manual)} ORDER BY `flow_date` DESC, `id` DESC',
+        tuple(manual_params),
+    )
+    trade_rows = db_query_all(
+        'SELECT `id`, `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type` '
+        f'FROM `trade_logs` WHERE {" AND ".join(where_trade)} ORDER BY `trade_date` DESC, `id` DESC',
+        tuple(trade_params),
+    )
+
+    events = []
+    manual_total = 0.0
+    deposit_total = 0.0
+    withdraw_total = 0.0
+    for row in manual_rows:
+        amount = float(row['amount'] or 0.0)
+        manual_total += amount
+        if amount >= 0:
+            deposit_total += amount
+        else:
+            withdraw_total += -amount
+        events.append({
+            'date': row['flow_date'],
+            'source': 'manual',
+            'source_label': '手工',
+            'type_label': '入金' if amount >= 0 else '出金',
+            'symbol': '',
+            'name': '',
+            'amount': amount,
+            'note': row.get('note') or '',
+            'flow_id': row['id'],
+        })
+
+    trade_total = 0.0
+    for row in trade_rows:
+        amount = _trade_cash_effect(row)
+        trade_total += amount
+        action = row['action']
+        if action == 'buy':
+            type_label = '买入扣现金'
+        elif action == 'sell':
+            type_label = '卖出转现金'
+        elif action == 'dividend':
+            type_label = '分红入现金'
+        else:
+            type_label = action
+        events.append({
+            'date': row['trade_date'],
+            'source': 'trade',
+            'source_label': '交易自动',
+            'type_label': type_label,
+            'symbol': row['symbol'],
+            'name': row.get('name') or '',
+            'amount': amount,
+            'note': f"{'基金' if row['asset_type'] == 'fund' else '股票'} {row['quantity']} x {row['price']}",
+            'flow_id': None,
+        })
+
+    events.sort(key=lambda item: (item['date'], item['source'] == 'manual'), reverse=True)
+    return {
+        'events': events,
+        'manual_total': manual_total,
+        'trade_total': trade_total,
+        'cash_balance': manual_total + trade_total,
+        'deposit_total': deposit_total,
+        'withdraw_total': withdraw_total,
+    }
+
+
 def _calculate_period_pnl_by_nav(
+    user_id: int,
     rows,
     start_date: dt.date,
     end_date: dt.date,
@@ -1821,8 +2249,14 @@ def _calculate_period_pnl_by_nav(
     end_positions = _build_quantity_positions_until(rows, end_date)
     start_values = _value_positions_at_date_by_asset(start_positions, previous_day, latest_quotes)
     end_values = _value_positions_at_date_by_asset(end_positions, end_date, latest_quotes)
-    start_value = sum(start_values.values())
-    end_value = sum(end_values.values())
+    start_position_value = sum(start_values.values())
+    end_position_value = sum(end_values.values())
+    start_cash = _account_cash_until(user_id, rows, previous_day)
+    end_cash = _account_cash_until(user_id, rows, end_date)
+    cash_flow_totals = _account_cash_flow_totals(user_id, start_date, end_date)
+    net_transfer = cash_flow_totals['net_transfer']
+    start_value = start_cash + start_position_value
+    end_value = end_cash + end_position_value
     buy_cost = 0.0
     sell_proceeds = 0.0
     dividend_income = 0.0
@@ -1883,11 +2317,18 @@ def _calculate_period_pnl_by_nav(
             - data['period_start_value']
             - data['period_buy_cost']
         )
-    period_pnl = end_value + sell_proceeds + dividend_income - start_value - buy_cost
+    period_pnl = end_value - start_value - net_transfer
     return {
         'period_pnl': period_pnl,
         'period_start_value': start_value,
         'period_end_value': end_value,
+        'period_start_position_value': start_position_value,
+        'period_end_position_value': end_position_value,
+        'period_start_cash': start_cash,
+        'period_end_cash': end_cash,
+        'period_net_transfer': net_transfer,
+        'period_deposit_amount': cash_flow_totals['deposits'],
+        'period_withdraw_amount': cash_flow_totals['withdrawals'],
         'period_buy_cost': buy_cost,
         'period_sell_proceeds': sell_proceeds,
         'period_dividend_income': dividend_income,
@@ -2095,20 +2536,8 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         key=lambda x: x['symbol'],
     )
 
-    profits = db_query_all(
-        'SELECT `id`, `profit_date`, `amount`, `note` FROM `initial_profits` '
-        'WHERE `user_id` = %s ORDER BY `profit_date` DESC, `id` DESC',
-        (user_id,),
-    )
-    initial_period_total = 0.0
-    for row in profits:
-        pdate = _parse_iso_date(row['profit_date'])
-        if pdate and start_date <= pdate <= end_date:
-            initial_period_total += float(row['amount'])
-
-    period_performance = _calculate_period_pnl_by_nav(rows, start_date, end_date, initial_quotes)
-    realized_with_initial = period_performance['period_pnl'] + initial_period_total
-    combined_total = realized_with_initial
+    period_performance = _calculate_period_pnl_by_nav(user_id, rows, start_date, end_date, initial_quotes)
+    period_pnl = period_performance['period_pnl']
     daily_total = daily_stock_pnl + daily_fund_pnl
     period_by_asset = period_performance.get('by_asset', {})
     profit_summary_rows = []
@@ -2135,7 +2564,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         {
             'asset_type': 'total',
             'label': '合计',
-            'period_pnl': realized_with_initial,
+            'period_pnl': period_pnl,
             'unrealized': sum(row['unrealized'] for row in profit_summary_rows),
             'daily_pnl': sum(row['daily_pnl'] for row in profit_summary_rows),
             'market_value': sum(row['market_value'] for row in profit_summary_rows),
@@ -2155,13 +2584,10 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'realized_items': realized_items,
         'realized_total': portfolio['realized_total'],
         'realized_all_time': portfolio['realized_all_time'],
-        'realized_with_initial': realized_with_initial,
-        'initial_period_total': initial_period_total,
-        'initial_profits': profits,
+        'period_pnl': period_pnl,
         'unrealized_total': unrealized_total,
         'total_market_value': total_market_value,
         'total_cost_basis': total_cost_basis,
-        'combined_total': combined_total,
         'profit_summary_rows': profit_summary_rows,
         'daily_stock_pnl': daily_stock_pnl,
         'daily_fund_pnl': daily_fund_pnl,
@@ -2173,6 +2599,13 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'period_buy_cost': period_performance['period_buy_cost'],
         'period_sell_proceeds': period_performance['period_sell_proceeds'],
         'period_dividend_income': period_performance['period_dividend_income'],
+        'period_start_position_value': period_performance['period_start_position_value'],
+        'period_end_position_value': period_performance['period_end_position_value'],
+        'period_start_cash': period_performance['period_start_cash'],
+        'period_end_cash': period_performance['period_end_cash'],
+        'period_net_transfer': period_performance['period_net_transfer'],
+        'period_deposit_amount': period_performance['period_deposit_amount'],
+        'period_withdraw_amount': period_performance['period_withdraw_amount'],
     }
 
 
@@ -2777,6 +3210,8 @@ def trades_view():
             'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
             (current_user.id, trade_date, symbol, trade_name or None, action, quantity, price, fee, stamp_tax, asset_type, None),
         )
+        if asset_type in {'stock', 'fund'}:
+            _start_trade_price_refresh(current_user.id, symbol, asset_type)
         flash('已记录交易。', 'success')
         return redirect(url_for('trades_view'))
 
@@ -2938,6 +3373,11 @@ def edit_trade(trade_id: int):
             '`stamp_tax`=%s, `asset_type`=%s, `note`=NULL WHERE `id`=%s AND `user_id`=%s',
             (trade_date, normalized_symbol, trade_name or None, action, quantity, price, fee, stamp_tax, asset_type, trade_id, current_user.id),
         )
+        if asset_type in {'stock', 'fund'}:
+            _start_trade_price_refresh(current_user.id, normalized_symbol, asset_type)
+        old_asset_type = trade['asset_type'] or 'stock'
+        if old_asset_type in {'stock', 'fund'} and (trade['symbol'] != normalized_symbol or old_asset_type != asset_type):
+            _start_trade_price_refresh(current_user.id, trade['symbol'], old_asset_type)
         flash('已更新交易。', 'success')
         return redirect(url_for('trades_view'))
 
@@ -2973,18 +3413,15 @@ def portfolio_view():
         'portfolio.html',
         positions=context['positions'],
         realized_total=context['realized_total'],
-        realized_with_initial=context['realized_with_initial'],
+        period_pnl=context['period_pnl'],
         realized_items=context['realized_items'],
         realized_all_time=context['realized_all_time'],
         unrealized_total=context['unrealized_total'],
         total_market_value=context['total_market_value'],
         total_cost_basis=context['total_cost_basis'],
-        combined_total=context['combined_total'],
         profit_summary_rows=context['profit_summary_rows'],
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
-        initial_period_total=context['initial_period_total'],
-        initial_profits=context['initial_profits'],
         today_str=today.isoformat(),
         daily_stock_pnl=context['daily_stock_pnl'],
         daily_fund_pnl=context['daily_fund_pnl'],
@@ -2996,7 +3433,77 @@ def portfolio_view():
         period_buy_cost=context['period_buy_cost'],
         period_sell_proceeds=context['period_sell_proceeds'],
         period_dividend_income=context['period_dividend_income'],
+        period_start_position_value=context['period_start_position_value'],
+        period_end_position_value=context['period_end_position_value'],
+        period_start_cash=context['period_start_cash'],
+        period_end_cash=context['period_end_cash'],
+        period_net_transfer=context['period_net_transfer'],
+        period_deposit_amount=context['period_deposit_amount'],
+        period_withdraw_amount=context['period_withdraw_amount'],
     )
+
+
+@app.route('/cash_flows', methods=['GET', 'POST'])
+@login_required
+def cash_flows_view():
+    if request.method == 'GET':
+        start_raw = (request.args.get('start') or '').strip()
+        end_raw = (request.args.get('end') or '').strip()
+        start_date = _parse_iso_date(start_raw)
+        end_date = _parse_iso_date(end_raw)
+        if start_date and end_date and end_date < start_date:
+            start_date, end_date = end_date, start_date
+        ledger = _cash_flow_ledger(current_user.id, start_date, end_date)
+        return render_template(
+            'cash_flows.html',
+            ledger=ledger,
+            start_date=start_date.isoformat() if start_date else start_raw,
+            end_date=end_date.isoformat() if end_date else end_raw,
+            today_str=dt.date.today().isoformat(),
+        )
+
+    flow_date_raw = request.form.get('flow_date', '').strip()
+    amount_raw = request.form.get('amount', '').strip()
+    flow_type = request.form.get('flow_type', 'deposit').strip()
+    note = request.form.get('note', '').strip()
+    flow_date = _parse_iso_date(flow_date_raw)
+    if flow_date is None:
+        flash('资金流水日期无效。', 'error')
+        return redirect(url_for('cash_flows_view'))
+    try:
+        amount = float(amount_raw)
+    except ValueError:
+        flash('资金流水金额需为数字。', 'error')
+        return redirect(url_for('cash_flows_view'))
+    if amount <= 0:
+        flash('资金流水金额必须大于 0。', 'error')
+        return redirect(url_for('cash_flows_view'))
+    if flow_type == 'withdraw':
+        amount = -amount
+    elif flow_type != 'deposit':
+        flash('资金流水类型无效。', 'error')
+        return redirect(url_for('cash_flows_view'))
+
+    db_execute(
+        'INSERT INTO `account_cash_flows` (`user_id`, `flow_date`, `amount`, `note`) VALUES (%s, %s, %s, %s)',
+        (current_user.id, flow_date, amount, note or None),
+    )
+    flash('资金流水已记录。', 'success')
+    return redirect(url_for('cash_flows_view'))
+
+
+@app.route('/cash_flows/<int:flow_id>/delete', methods=['POST'])
+@login_required
+def delete_cash_flow(flow_id: int):
+    rowcount = db_execute(
+        'DELETE FROM `account_cash_flows` WHERE `id` = %s AND `user_id` = %s',
+        (flow_id, current_user.id),
+    )
+    if rowcount:
+        flash('资金流水已删除。', 'success')
+    else:
+        flash('未找到对应资金流水。', 'error')
+    return redirect(url_for('cash_flows_view'))
 
 
 @app.route('/daily_profits', methods=['GET'])
@@ -3061,35 +3568,6 @@ def daily_profits_view():
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
     )
-
-
-@app.route('/initial_profits', methods=['POST'])
-@login_required
-def add_initial_profit():
-    amount_raw = request.form.get('amount', '').strip()
-    try:
-        amount = float(amount_raw)
-    except ValueError:
-        flash('初始盈利需为数字。', 'error')
-        return redirect(url_for('portfolio_view'))
-    profit_date = dt.date.today().isoformat()
-    db_execute(
-        'INSERT INTO `initial_profits` (`user_id`, `profit_date`, `amount`, `note`) VALUES (%s, %s, %s, %s)',
-        (current_user.id, profit_date, amount, None),
-    )
-    flash('已记录初始盈利。', 'success')
-    return redirect(url_for('portfolio_view'))
-
-
-@app.route('/initial_profits/<int:profit_id>/delete', methods=['POST'])
-@login_required
-def delete_initial_profit(profit_id: int):
-    rowcount = db_execute('DELETE FROM `initial_profits` WHERE `id` = %s AND `user_id` = %s', (profit_id, current_user.id))
-    if rowcount:
-        flash('已删除初始盈利记录。', 'success')
-    else:
-        flash('未找到对应记录。', 'error')
-    return redirect(url_for('portfolio_view'))
 
 
 @app.route('/reset_token', methods=['POST'])
@@ -3349,7 +3827,7 @@ def generate_rss_response(token: str):
 
         daily_ratio_txt = fmt_pct(snapshot.get('daily_ratio'))
         portfolio_desc = (
-            f"<p>周期盈亏：{fmt_currency(snapshot['realized_with_initial'])} 元</p>"
+            f"<p>周期盈亏：{fmt_currency(snapshot['period_pnl'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
             f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元；比例：{daily_ratio_txt})</p>"
             f"<table style='{table_style}'>"
@@ -3440,6 +3918,15 @@ if PRICE_ALERT_ENABLED:
         should_start_price_alert = False
     if should_start_price_alert:
         _start_price_alert_worker()
+
+if os.environ.get('DISABLE_DAILY_PRICE_CACHE_WORKER') != '1':
+    should_start_price_cache = True
+    if app.debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        should_start_price_cache = False
+    if app.config.get('TESTING'):
+        should_start_price_cache = False
+    if should_start_price_cache:
+        _start_daily_price_cache_worker()
 
 
 if __name__ == '__main__':

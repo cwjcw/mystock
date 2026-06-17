@@ -1,11 +1,22 @@
 {% extends 'layout.html' %}
 {% block content %}
-<h2>盈亏概览与持仓</h2>
-<form method="get" class="pnl-form range">
-  <label for="start">开始日期</label>
-  <input id="start" name="start" type="date" value="{{ start_date }}">
-  <label for="end">结束日期</label>
-  <input id="end" name="end" type="date" value="{{ end_date }}">
+<header class="portfolio-hero">
+  <div>
+    <p class="eyebrow">Portfolio cockpit</p>
+    <h2>盈亏概览与持仓</h2>
+    <p class="hero-subtitle">按总资产口径计算：期末总资产 - 期初总资产 - 净转入资金。</p>
+  </div>
+</header>
+
+<form method="get" class="pnl-form range panel-card">
+  <div class="form-row">
+    <label for="start">开始日期</label>
+    <input id="start" name="start" type="date" value="{{ start_date }}">
+  </div>
+  <div class="form-row">
+    <label for="end">结束日期</label>
+    <input id="end" name="end" type="date" value="{{ end_date }}">
+  </div>
   <div class="actions">
     <button class="btn" type="submit">重新计算</button>
   </div>
@@ -36,21 +47,16 @@
     <li class="profit-item">
       <div class="profit-line">
         <span class="profit-label">周期盈亏</span>
-        <span class="profit-value {{ 'profit-positive' if realized_with_initial > 0 else 'profit-negative' if realized_with_initial < 0 else '' }}">{{ '%.2f'|format(realized_with_initial) }} 元</span>
+        <span class="profit-value {{ 'profit-positive' if period_pnl > 0 else 'profit-negative' if period_pnl < 0 else '' }}">{{ '%.2f'|format(period_pnl) }} 元</span>
       </div>
       <div class="profit-extra">
-        <div>期初：{{ '%.2f'|format(period_start_value) }} 元</div>
-        <div>期末：{{ '%.2f'|format(period_end_value) }} 元</div>
-        <div>买入：{{ '%.2f'|format(period_buy_cost) }} 元</div>
-        <div>卖出/分红：{{ '%.2f'|format(period_sell_proceeds + period_dividend_income) }} 元</div>
+        <div>期初总资产：{{ '%.2f'|format(period_start_value) }} 元</div>
+        <div>期末总资产：{{ '%.2f'|format(period_end_value) }} 元</div>
+        <div>净转入资金：{{ '%.2f'|format(period_net_transfer) }} 元</div>
+        <div>期初现金：{{ '%.2f'|format(period_start_cash) }} 元；期初持仓市值：{{ '%.2f'|format(period_start_position_value) }} 元</div>
+        <div>期末现金：{{ '%.2f'|format(period_end_cash) }} 元；期末持仓市值：{{ '%.2f'|format(period_end_position_value) }} 元</div>
+        <div>入金：{{ '%.2f'|format(period_deposit_amount) }} 元；出金：{{ '%.2f'|format(period_withdraw_amount) }} 元</div>
       </div>
-    </li>
-    <li class="profit-item">
-      <div class="profit-line">
-        <span class="profit-label">区间总收益</span>
-        <span class="profit-value {{ 'profit-positive' if combined_total > 0 else 'profit-negative' if combined_total < 0 else '' }}">{{ '%.2f'|format(combined_total) }} 元</span>
-      </div>
-      <div class="profit-extra">与周期盈亏一致，按期初/期末市值和期间现金流计算。</div>
     </li>
     <li class="profit-item">
       <div class="profit-line">
@@ -79,7 +85,7 @@
   </ul>
 </section>
 
-<section class="profit-breakdown">
+<section class="profit-breakdown panel-card">
   <h3>盈利情况</h3>
   <table class="profit-breakdown-table">
     <thead>
@@ -107,7 +113,7 @@
   </table>
 </section>
 
-<section class="positions">
+<section class="positions panel-card">
   <h3>当前持仓</h3>
   {% if positions %}
     <ul class="position-list">
@@ -198,43 +204,5 @@
   {% else %}
     <div class="empty">暂无持仓。</div>
   {% endif %}
-</section>
-
-<section class="initial-profit">
-  <h3>初始盈利记录</h3>
-  <form method="post" action="{{ url_for('add_initial_profit') }}" class="initial-form">
-    <label for="init_amount">金额</label>
-    <input id="init_amount" name="amount" type="number" step="0.01" required>
-    <div class="actions">
-      <button class="btn" type="submit">新增初始盈利</button>
-    </div>
-    <p class="muted">日期固定为今日：{{ today_str }}</p>
-  </form>
-  <table border="1" cellpadding="6" cellspacing="0">
-    <thead>
-      <tr>
-        <th>日期</th>
-        <th>金额</th>
-        <th>操作</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for item in initial_profits %}
-        <tr>
-          <td>{{ item['profit_date'] }}</td>
-          <td class="{{ 'profit-positive' if item['amount'] > 0 else 'profit-negative' if item['amount'] < 0 else '' }}">{{ '%.2f'|format(item['amount']) }}</td>
-          <td>
-            <form method="post" action="{{ url_for('delete_initial_profit', profit_id=item['id']) }}" onsubmit="return confirm('确认删除该记录？');">
-              <button class="btn" type="submit">删除</button>
-            </form>
-          </td>
-        </tr>
-      {% else %}
-        <tr>
-          <td colspan="3">暂无初始盈利记录。</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
 </section>
 {% endblock %}
