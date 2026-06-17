@@ -34,6 +34,11 @@
       .history th, .history td { text-align:center; }
       .history-table td:nth-child(2), .history-table th:nth-child(2) { width:24%; }
       .history-meta { display:flex; justify-content:space-between; align-items:center; margin-bottom:.5rem; }
+      .trade-filter { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:.4rem .75rem; align-items:end; margin-bottom:.75rem; padding:.75rem; border:1px solid #ddd; border-radius:6px; background:#fafafa; }
+      .trade-filter .form-row { display:flex; flex-direction:column; gap:.25rem; }
+      .trade-filter label { font-size:.8rem; color:#555; margin:0; }
+      .trade-filter input { width:100%; padding:.45rem .5rem; box-sizing:border-box; }
+      .trade-filter .actions { margin-top:0; display:flex; gap:.5rem; align-items:center; }
       .pagination { margin-top:.75rem; display:flex; gap:.75rem; align-items:center; }
       .table-actions { display:flex; gap:.5rem; justify-content:center; }
       .table-actions form { margin:0; }

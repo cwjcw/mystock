@@ -55,6 +55,24 @@
   </section>
 
   <section class="history">
+    <form method="get" class="trade-filter">
+      <div class="form-row">
+        <label for="filter_start">开始日期</label>
+        <input id="filter_start" name="start" type="date" value="{{ filters.start }}">
+      </div>
+      <div class="form-row">
+        <label for="filter_end">结束日期</label>
+        <input id="filter_end" name="end" type="date" value="{{ filters.end }}">
+      </div>
+      <div class="form-row">
+        <label for="filter_symbol">代码</label>
+        <input id="filter_symbol" name="symbol" type="text" value="{{ filters.symbol }}" placeholder="000981 / 000981.SZ">
+      </div>
+      <div class="actions">
+        <button class="btn" type="submit">筛选</button>
+        <a class="btn" href="{{ url_for('trades_view') }}">重置</a>
+      </div>
+    </form>
     <div class="history-meta">
       <strong>历史交易</strong>
       <span>共 {{ total }} 条，当前第 {{ page }} / {{ pages }} 页</span>
@@ -103,11 +121,11 @@
     {% if pages > 1 %}
       <div class="pagination">
         {% if page > 1 %}
-          <a class="btn" href="{{ url_for('trades_view', page=page-1) }}">上一页</a>
+          <a class="btn" href="{{ url_for('trades_view', page=page-1, start=filters.start, end=filters.end, symbol=filters.symbol) }}">上一页</a>
         {% endif %}
         <span>第 {{ page }} / {{ pages }} 页</span>
         {% if page < pages %}
-          <a class="btn" href="{{ url_for('trades_view', page=page+1) }}">下一页</a>
+          <a class="btn" href="{{ url_for('trades_view', page=page+1, start=filters.start, end=filters.end, symbol=filters.symbol) }}">下一页</a>
         {% endif %}
       </div>
     {% endif %}

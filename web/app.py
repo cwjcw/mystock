@@ -95,6 +95,7 @@ _TRADING_CAL_TTL_SECONDS = 6 * 3600  # refresh trading calendar every 6 hours by
 _STOCK_NAME_CACHE: Optional[Dict[str, str]] = None
 _STOCK_NAME_CACHE_LAST_FETCH: Optional[float] = None
 _STOCK_NAME_CACHE_TTL_SECONDS = 24 * 3600
+_HISTORICAL_PRICE_CACHE: Dict[tuple[str, dt.date], Optional[float]] = {}
 PRICE_ALERT_RULES_FILE = Path(os.environ.get('PRICE_ALERT_RULES_FILE', str(DATA_DIR / 'stock_price_alerts.txt')))
 PRICE_ALERT_INTERVAL = max(15, int(os.environ.get('PRICE_ALERT_INTERVAL', '30')))
 PRICE_ALERT_DAILY_HOUR = int(os.environ.get('PRICE_ALERT_DAILY_HOUR', '14'))
@@ -1722,6 +1723,130 @@ def _build_portfolio(rows, start_date: dt.date, end_date: dt.date, name_cache: D
     }
 
 
+def _fetch_stock_close_on_or_before(symbol: str, target_date: dt.date) -> Optional[float]:
+    key = (symbol, target_date)
+    if key in _HISTORICAL_PRICE_CACHE:
+        return _HISTORICAL_PRICE_CACHE[key]
+    if not symbol.upper().endswith(('.SH', '.SZ')):
+        _HISTORICAL_PRICE_CACHE[key] = None
+        return None
+    token = os.environ.get('TUSHARE_TOKEN')
+    if not token:
+        _HISTORICAL_PRICE_CACHE[key] = None
+        return None
+    try:
+        import tushare as ts  # type: ignore
+
+        ts.set_token(token)
+        pro = ts.pro_api()
+        start = target_date - dt.timedelta(days=20)
+        df = pro.daily(
+            ts_code=symbol,
+            start_date=start.strftime('%Y%m%d'),
+            end_date=target_date.strftime('%Y%m%d'),
+        )
+    except Exception as exc:
+        logger.warning('获取历史收盘价失败 %s %s: %s', symbol, target_date, exc)
+        _HISTORICAL_PRICE_CACHE[key] = None
+        return None
+    if df is None or df.empty or 'close' not in df:
+        _HISTORICAL_PRICE_CACHE[key] = None
+        return None
+    try:
+        df = df.sort_values('trade_date')
+        close = float(df.iloc[-1]['close'])
+    except Exception:
+        close = None
+    _HISTORICAL_PRICE_CACHE[key] = close
+    return close
+
+
+def _build_quantity_positions_until(rows, cutoff_date: dt.date) -> Dict[str, dict]:
+    positions: Dict[str, dict] = {}
+    for row in rows:
+        trade_day = _parse_iso_date(row['trade_date'])
+        if not trade_day or trade_day > cutoff_date:
+            continue
+        symbol = row['symbol']
+        action = row['action']
+        try:
+            quantity = float(row['quantity'] or 0.0)
+        except (TypeError, ValueError):
+            continue
+        asset_type = row.get('asset_type') or 'stock'
+        entry = positions.setdefault(symbol, {'quantity': 0.0, 'asset_type': asset_type})
+        entry['asset_type'] = asset_type
+        if action == 'buy':
+            entry['quantity'] += quantity
+        elif action == 'sell':
+            entry['quantity'] -= quantity
+    return {sym: data for sym, data in positions.items() if data['quantity'] > 1e-9}
+
+
+def _value_positions_at_date(positions: Dict[str, dict], value_date: dt.date, latest_quotes: Dict[str, dict]) -> float:
+    total = 0.0
+    today = dt.datetime.now(CHINA_TZ).date()
+    for symbol, data in positions.items():
+        quantity = float(data.get('quantity') or 0.0)
+        if quantity <= 0:
+            continue
+        asset_type = data.get('asset_type') or 'stock'
+        price = None
+        if value_date >= today:
+            price = (latest_quotes.get(symbol) or {}).get('price')
+        if price is None and asset_type == 'stock':
+            price = _fetch_stock_close_on_or_before(symbol, value_date)
+        if price is None:
+            price = (latest_quotes.get(symbol) or {}).get('price')
+        if price is None:
+            continue
+        total += quantity * float(price)
+    return total
+
+
+def _calculate_period_pnl_by_nav(
+    rows,
+    start_date: dt.date,
+    end_date: dt.date,
+    latest_quotes: Dict[str, dict],
+) -> Dict[str, float]:
+    previous_day = start_date - dt.timedelta(days=1)
+    start_positions = _build_quantity_positions_until(rows, previous_day)
+    end_positions = _build_quantity_positions_until(rows, end_date)
+    start_value = _value_positions_at_date(start_positions, previous_day, latest_quotes)
+    end_value = _value_positions_at_date(end_positions, end_date, latest_quotes)
+    buy_cost = 0.0
+    sell_proceeds = 0.0
+    dividend_income = 0.0
+    for row in rows:
+        trade_day = _parse_iso_date(row['trade_date'])
+        if not trade_day or trade_day < start_date or trade_day > end_date:
+            continue
+        try:
+            quantity = float(row['quantity'] or 0.0)
+            price = float(row['price'] or 0.0)
+            fee = float(row['fee'] or 0.0)
+            stamp_tax = float(row['stamp_tax'] or 0.0)
+        except (TypeError, ValueError):
+            continue
+        amount = quantity * price
+        if row['action'] == 'buy':
+            buy_cost += amount + fee + stamp_tax
+        elif row['action'] == 'sell':
+            sell_proceeds += amount - fee - stamp_tax
+        elif row['action'] == 'dividend':
+            dividend_income += amount - fee - stamp_tax
+    period_pnl = end_value + sell_proceeds + dividend_income - start_value - buy_cost
+    return {
+        'period_pnl': period_pnl,
+        'period_start_value': start_value,
+        'period_end_value': end_value,
+        'period_buy_cost': buy_cost,
+        'period_sell_proceeds': sell_proceeds,
+        'period_dividend_income': dividend_income,
+    }
+
+
 def _calculate_available_quantity_before_trade(
     user_id: int,
     symbol: str,
@@ -1920,7 +2045,8 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         if pdate and start_date <= pdate <= end_date:
             initial_period_total += float(row['amount'])
 
-    realized_with_initial = portfolio['realized_total'] + initial_period_total
+    period_performance = _calculate_period_pnl_by_nav(rows, start_date, end_date, initial_quotes)
+    realized_with_initial = period_performance['period_pnl'] + initial_period_total
     combined_total = realized_with_initial + unrealized_total
     daily_total = daily_stock_pnl + daily_fund_pnl
     base_for_daily_ratio = total_market_value if abs(total_market_value) > 1e-9 else total_cost_basis
@@ -1948,6 +2074,11 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'daily_total': daily_total,
         'daily_ratio': daily_ratio,
         'unrealized_ratio': unrealized_ratio,
+        'period_start_value': period_performance['period_start_value'],
+        'period_end_value': period_performance['period_end_value'],
+        'period_buy_cost': period_performance['period_buy_cost'],
+        'period_sell_proceeds': period_performance['period_sell_proceeds'],
+        'period_dividend_income': period_performance['period_dividend_income'],
     }
 
 
@@ -2563,7 +2694,37 @@ def trades_view():
     if page < 1:
         page = 1
     per_page = 50
-    total_row = db_query_one('SELECT COUNT(1) AS cnt FROM `trade_logs` WHERE `user_id` = %s', (current_user.id,))
+    start_raw = (request.args.get('start') or '').strip()
+    end_raw = (request.args.get('end') or '').strip()
+    symbol_filter_raw = (request.args.get('symbol') or '').strip()
+    start_date = _parse_iso_date(start_raw)
+    end_date = _parse_iso_date(end_raw)
+    if start_date and end_date and end_date < start_date:
+        start_date, end_date = end_date, start_date
+        start_raw, end_raw = start_date.isoformat(), end_date.isoformat()
+
+    where_parts = ['`user_id` = %s']
+    where_params: List = [current_user.id]
+    if start_date:
+        where_parts.append('`trade_date` >= %s')
+        where_params.append(start_date)
+    if end_date:
+        where_parts.append('`trade_date` <= %s')
+        where_params.append(end_date)
+    normalized_symbol_filter = None
+    if symbol_filter_raw:
+        _filter_name, filter_symbol = _split_symbol_name_input(symbol_filter_raw)
+        normalized_symbol_filter = _normalize_trade_symbol(filter_symbol, 'stock') or _normalize_trade_symbol(filter_symbol, 'fund')
+        if normalized_symbol_filter:
+            where_parts.append('`symbol` = %s')
+            where_params.append(normalized_symbol_filter)
+        else:
+            where_parts.append('(`symbol` LIKE %s OR `name` LIKE %s)')
+            like_value = f'%{symbol_filter_raw}%'
+            where_params.extend([like_value, like_value])
+
+    where_sql = ' AND '.join(where_parts)
+    total_row = db_query_one(f'SELECT COUNT(1) AS cnt FROM `trade_logs` WHERE {where_sql}', tuple(where_params))
     total = total_row['cnt'] if total_row else 0
     total = total or 0
     max_page = max(1, math.ceil(total / per_page)) if total else 1
@@ -2572,8 +2733,8 @@ def trades_view():
     offset = (page - 1) * per_page
     trades = db_query_all(
         'SELECT `id`, `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type`, `note`, `created_at` '
-        'FROM `trade_logs` WHERE `user_id` = %s ORDER BY `trade_date` DESC, `id` DESC LIMIT %s OFFSET %s',
-        (current_user.id, per_page, offset),
+        f'FROM `trade_logs` WHERE {where_sql} ORDER BY `trade_date` DESC, `id` DESC LIMIT %s OFFSET %s',
+        tuple(where_params + [per_page, offset]),
     )
 
     name_map: Dict[str, str] = {}
@@ -2604,6 +2765,11 @@ def trades_view():
         per_page=per_page,
         total=total,
         name_map=name_map,
+        filters={
+            'start': start_date.isoformat() if start_date else start_raw,
+            'end': end_date.isoformat() if end_date else end_raw,
+            'symbol': symbol_filter_raw,
+        },
     )
 
 
@@ -2730,6 +2896,11 @@ def portfolio_view():
         daily_total=context['daily_total'],
         daily_ratio=context['daily_ratio'],
         unrealized_ratio=context['unrealized_ratio'],
+        period_start_value=context['period_start_value'],
+        period_end_value=context['period_end_value'],
+        period_buy_cost=context['period_buy_cost'],
+        period_sell_proceeds=context['period_sell_proceeds'],
+        period_dividend_income=context['period_dividend_income'],
     )
 
 

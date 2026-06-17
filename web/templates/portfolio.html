@@ -38,6 +38,12 @@
         <span class="profit-label">周期盈亏</span>
         <span class="profit-value {{ 'profit-positive' if realized_with_initial > 0 else 'profit-negative' if realized_with_initial < 0 else '' }}">{{ '%.2f'|format(realized_with_initial) }} 元</span>
       </div>
+      <div class="profit-extra">
+        <div>期初：{{ '%.2f'|format(period_start_value) }} 元</div>
+        <div>期末：{{ '%.2f'|format(period_end_value) }} 元</div>
+        <div>买入：{{ '%.2f'|format(period_buy_cost) }} 元</div>
+        <div>卖出/分红：{{ '%.2f'|format(period_sell_proceeds + period_dividend_income) }} 元</div>
+      </div>
     </li>
     <li class="profit-item">
       <div class="profit-line">
