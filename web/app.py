@@ -2107,6 +2107,49 @@ def _trade_cash_until(rows, cutoff_date: dt.date) -> float:
     return total
 
 
+def _xirr(cash_flows: List[tuple[dt.date, float]]) -> Optional[float]:
+    flows = [(date, float(amount)) for date, amount in cash_flows if abs(float(amount)) > 1e-9]
+    if not flows:
+        return None
+    has_positive = any(amount > 0 for _date, amount in flows)
+    has_negative = any(amount < 0 for _date, amount in flows)
+    if not has_positive or not has_negative:
+        return None
+
+    base_date = min(date for date, _amount in flows)
+
+    def npv(rate: float) -> float:
+        total = 0.0
+        for date, amount in flows:
+            years = (date - base_date).days / 365.0
+            total += amount / ((1.0 + rate) ** years)
+        return total
+
+    low = -0.999999
+    high = 1.0
+    low_value = npv(low)
+    high_value = npv(high)
+    expand_count = 0
+    while low_value * high_value > 0 and expand_count < 80:
+        high = (high + 1.0) * 2.0 - 1.0
+        high_value = npv(high)
+        expand_count += 1
+    if low_value * high_value > 0:
+        return None
+
+    for _ in range(120):
+        mid = (low + high) / 2.0
+        mid_value = npv(mid)
+        if abs(mid_value) < 1e-7:
+            return mid
+        if low_value * mid_value <= 0:
+            high = mid
+        else:
+            low = mid
+            low_value = mid_value
+    return (low + high) / 2.0
+
+
 def _account_cash_flow_sum(user_id: int, start_date: Optional[dt.date], end_date: dt.date) -> float:
     if start_date is None:
         row = db_query_one(
@@ -2144,6 +2187,15 @@ def _account_cash_flow_totals(user_id: int, start_date: dt.date, end_date: dt.da
         'withdrawals': withdrawals,
         'net_transfer': deposits - withdrawals,
     }
+
+
+def _account_cash_flow_rows(user_id: int, start_date: dt.date, end_date: dt.date) -> List[Dict]:
+    return db_query_all(
+        'SELECT `flow_date`, `amount` FROM `account_cash_flows` '
+        'WHERE `user_id` = %s AND `flow_date` >= %s AND `flow_date` <= %s '
+        'ORDER BY `flow_date` ASC, `id` ASC',
+        (user_id, start_date, end_date),
+    )
 
 
 def _account_cash_until(user_id: int, rows, cutoff_date: dt.date) -> float:
@@ -2274,6 +2326,7 @@ def _calculate_period_pnl_by_nav(
             'period_buy_cost': 0.0,
             'period_sell_proceeds': 0.0,
             'period_dividend_income': 0.0,
+            'cash_flows': [],
         },
         'fund': {
             'period_start_value': start_values.get('fund', 0.0),
@@ -2281,8 +2334,26 @@ def _calculate_period_pnl_by_nav(
             'period_buy_cost': 0.0,
             'period_sell_proceeds': 0.0,
             'period_dividend_income': 0.0,
+            'cash_flows': [],
         },
     }
+    period_cash_flows: List[tuple[dt.date, float]] = []
+    if start_value > 1e-9:
+        period_cash_flows.append((previous_day, -start_value))
+    for flow in _account_cash_flow_rows(user_id, start_date, end_date):
+        flow_day = _parse_iso_date(flow.get('flow_date'))
+        if not flow_day:
+            continue
+        try:
+            transfer_amount = float(flow.get('amount') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if abs(transfer_amount) <= 1e-9:
+            continue
+        period_cash_flows.append((flow_day, -transfer_amount))
+    for asset_data in by_asset.values():
+        if asset_data['period_start_value'] > 1e-9:
+            asset_data['cash_flows'].append((previous_day, -asset_data['period_start_value']))
     for row in rows:
         trade_day = _parse_iso_date(row['trade_date'])
         if not trade_day or trade_day < start_date or trade_day > end_date:
@@ -2303,19 +2374,30 @@ def _calculate_period_pnl_by_nav(
                 'period_buy_cost': 0.0,
                 'period_sell_proceeds': 0.0,
                 'period_dividend_income': 0.0,
+                'cash_flows': [],
             }
+            if by_asset[asset_type]['period_start_value'] > 1e-9:
+                by_asset[asset_type]['cash_flows'].append((previous_day, -by_asset[asset_type]['period_start_value']))
         if row['action'] == 'buy':
             value = amount + fee + stamp_tax
             buy_cost += value
             by_asset[asset_type]['period_buy_cost'] += value
+            by_asset[asset_type]['cash_flows'].append((trade_day, -value))
         elif row['action'] == 'sell':
             value = amount - fee - stamp_tax
             sell_proceeds += value
             by_asset[asset_type]['period_sell_proceeds'] += value
+            by_asset[asset_type]['cash_flows'].append((trade_day, value))
         elif row['action'] == 'dividend':
             value = amount - fee - stamp_tax
             dividend_income += value
             by_asset[asset_type]['period_dividend_income'] += value
+            by_asset[asset_type]['cash_flows'].append((trade_day, value))
+    if end_value > 1e-9:
+        period_cash_flows.append((end_date, end_value))
+    for asset_data in by_asset.values():
+        if asset_data['period_end_value'] > 1e-9:
+            asset_data['cash_flows'].append((end_date, asset_data['period_end_value']))
     for data in by_asset.values():
         data['period_pnl'] = (
             data['period_end_value']
@@ -2325,14 +2407,19 @@ def _calculate_period_pnl_by_nav(
             - data['period_buy_cost']
         )
         period_base = data['period_start_value'] + data['period_buy_cost']
-        data['period_ratio'] = (data['period_pnl'] / period_base * 100) if abs(period_base) > 1e-9 else None
+        data['period_ratio_base'] = period_base
+        asset_xirr = _xirr(data['cash_flows'])
+        data['period_ratio'] = asset_xirr * 100 if asset_xirr is not None else None
+        data.pop('cash_flows', None)
     period_pnl = sum(data['period_pnl'] for data in by_asset.values())
-    period_base = start_position_value + buy_cost
-    period_ratio = (period_pnl / period_base * 100) if abs(period_base) > 1e-9 else None
+    period_ratio_base = start_value + cash_flow_totals['deposits']
+    period_xirr = _xirr(period_cash_flows)
+    period_ratio = period_xirr * 100 if period_xirr is not None else None
     account_value_change = end_value - start_value - net_transfer
     return {
         'period_pnl': period_pnl,
         'period_ratio': period_ratio,
+        'period_ratio_base': period_ratio_base,
         'account_value_change': account_value_change,
         'period_start_value': start_value,
         'period_end_value': end_value,
@@ -2569,6 +2656,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
                 'label': label,
                 'period_pnl': period_values.get('period_pnl', 0.0),
                 'period_ratio': period_values.get('period_ratio'),
+                'period_ratio_base': period_values.get('period_ratio_base'),
                 'unrealized': unrealized_value,
                 'daily_pnl': current_values.get('daily_pnl', 0.0),
                 'market_value': market_value,
@@ -2581,6 +2669,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
             'label': '合计',
             'period_pnl': period_pnl,
             'period_ratio': period_performance.get('period_ratio'),
+            'period_ratio_base': period_performance.get('period_ratio_base'),
             'unrealized': sum(row['unrealized'] for row in profit_summary_rows),
             'daily_pnl': sum(row['daily_pnl'] for row in profit_summary_rows),
             'market_value': sum(row['market_value'] for row in profit_summary_rows),
@@ -2602,6 +2691,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'realized_all_time': portfolio['realized_all_time'],
         'period_pnl': period_pnl,
         'period_ratio': period_performance['period_ratio'],
+        'period_ratio_base': period_performance['period_ratio_base'],
         'unrealized_total': unrealized_total,
         'total_market_value': total_market_value,
         'total_cost_basis': total_cost_basis,
@@ -3433,6 +3523,7 @@ def portfolio_view():
         realized_total=context['realized_total'],
         period_pnl=context['period_pnl'],
         period_ratio=context['period_ratio'],
+        period_ratio_base=context['period_ratio_base'],
         realized_items=context['realized_items'],
         realized_all_time=context['realized_all_time'],
         unrealized_total=context['unrealized_total'],
@@ -3789,7 +3880,7 @@ def generate_rss_response(token: str):
             if val is None:
                 return '-'
             try:
-                return f"{val:.2f}"
+                return f"{val:,.0f}"
             except Exception:
                 return '-'
 
@@ -3804,7 +3895,8 @@ def generate_rss_response(token: str):
             except (TypeError, ValueError):
                 return str(val)
             color = '#c62828' if num > 0 else '#1e7a1e' if num < 0 else '#333'
-            return f"<span style='color:{color}'>{num:.2f}{suffix}</span>"
+            text = f"{num:.2f}{suffix}" if suffix else f"{num:,.0f}"
+            return f"<span style='color:{color}'>{text}</span>"
 
         table_style = "width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed;word-break:break-word;"
         th_style = "style='padding:4px;border:1px solid #ddd;background:#f7f7f7;text-align:left;font-weight:600;'"
@@ -3848,7 +3940,8 @@ def generate_rss_response(token: str):
         daily_ratio_txt = fmt_pct(snapshot.get('daily_ratio'))
         period_ratio_txt = fmt_pct(snapshot.get('period_ratio'))
         portfolio_desc = (
-            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元；收益率：{period_ratio_txt}</p>"
+            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元；资金加权收益率：{period_ratio_txt}</p>"
+            f"<p>账户投入金额：{fmt_currency(snapshot['period_ratio_base'])} 元</p>"
             f"<p>账户资产变动：{fmt_currency(snapshot['account_value_change'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
             f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元；比例：{daily_ratio_txt})</p>"

@@ -1,5 +1,8 @@
 {% extends 'layout.html' %}
 {% block content %}
+{% macro money0(value) -%}
+{{- '-' if value is none else '{:,.0f}'.format(value) -}}
+{%- endmacro %}
 <header class="portfolio-hero">
   <div>
     <p class="eyebrow">Portfolio cockpit</p>
@@ -57,41 +60,42 @@
     <li class="profit-item">
       <div class="profit-line">
         <span class="profit-label">周期交易盈亏</span>
-        <span class="profit-value {{ 'profit-positive' if period_pnl > 0 else 'profit-negative' if period_pnl < 0 else '' }}">{{ '%.2f'|format(period_pnl) }} 元</span>
+        <span class="profit-value {{ 'profit-positive' if period_pnl > 0 else 'profit-negative' if period_pnl < 0 else '' }}">{{ money0(period_pnl) }} 元</span>
       </div>
-      <div class="profit-secondary">周期收益率：<span class="{{ period_ratio_class }}">{{ period_ratio_text }}</span></div>
+      <div class="profit-secondary">资金加权年化收益率：<span class="{{ period_ratio_class }}">{{ period_ratio_text }}</span></div>
       <div class="profit-extra">
-        <div>账户资产变动：{{ '%.2f'|format(account_value_change) }} 元</div>
-        <div>期初总资产：{{ '%.2f'|format(period_start_value) }} 元</div>
-        <div>期末总资产：{{ '%.2f'|format(period_end_value) }} 元</div>
-        <div>净转入资金：{{ '%.2f'|format(period_net_transfer) }} 元</div>
-        <div>期初现金：{{ '%.2f'|format(period_start_cash) }} 元；期初持仓市值：{{ '%.2f'|format(period_start_position_value) }} 元</div>
-        <div>期末现金：{{ '%.2f'|format(period_end_cash) }} 元；期末持仓市值：{{ '%.2f'|format(period_end_position_value) }} 元</div>
-        <div>入金：{{ '%.2f'|format(period_deposit_amount) }} 元；出金：{{ '%.2f'|format(period_withdraw_amount) }} 元</div>
+        <div>账户投入金额：{{ money0(period_ratio_base) }} 元</div>
+        <div>账户资产变动：{{ money0(account_value_change) }} 元</div>
+        <div>期初总资产：{{ money0(period_start_value) }} 元</div>
+        <div>期末总资产：{{ money0(period_end_value) }} 元</div>
+        <div>净转入资金：{{ money0(period_net_transfer) }} 元</div>
+        <div>期初现金：{{ money0(period_start_cash) }} 元；期初持仓市值：{{ money0(period_start_position_value) }} 元</div>
+        <div>期末现金：{{ money0(period_end_cash) }} 元；期末持仓市值：{{ money0(period_end_position_value) }} 元</div>
+        <div>入金：{{ money0(period_deposit_amount) }} 元；出金：{{ money0(period_withdraw_amount) }} 元</div>
       </div>
     </li>
     <li class="profit-item">
       <div class="profit-line">
         <span class="profit-label">持仓盈亏</span>
-        <span class="profit-value {{ 'profit-positive' if unrealized_total > 0 else 'profit-negative' if unrealized_total < 0 else '' }}">{{ '%.2f'|format(unrealized_total) }} 元</span>
+        <span class="profit-value {{ 'profit-positive' if unrealized_total > 0 else 'profit-negative' if unrealized_total < 0 else '' }}">{{ money0(unrealized_total) }} 元</span>
       </div>
       <div class="profit-secondary">比例：<span class="{{ unrealized_ratio_class }}">{{ unrealized_ratio_text }}</span></div>
       <div class="profit-extra">
-        <div>成本：{{ '%.2f'|format(total_cost_basis) }} 元</div>
-        <div>市值：{{ '%.2f'|format(total_market_value) }} 元</div>
+        <div>成本：{{ money0(total_cost_basis) }} 元</div>
+        <div>市值：{{ money0(total_market_value) }} 元</div>
       </div>
     </li>
     <li class="profit-item">
       <div class="profit-line">
         <span class="profit-label">当日盈亏</span>
-        <span class="profit-value {{ 'profit-positive' if daily_total > 0 else 'profit-negative' if daily_total < 0 else '' }}">{{ '%.2f'|format(daily_total) }} 元</span>
+        <span class="profit-value {{ 'profit-positive' if daily_total > 0 else 'profit-negative' if daily_total < 0 else '' }}">{{ money0(daily_total) }} 元</span>
       </div>
       <div class="profit-secondary">比例：<span class="{{ daily_ratio_class }}">{{ daily_ratio_text }}</span></div>
       {% set daily_stock_class = 'profit-positive' if daily_stock_pnl > 0 else 'profit-negative' if daily_stock_pnl < 0 else '' %}
       {% set daily_fund_class = 'profit-positive' if daily_fund_pnl > 0 else 'profit-negative' if daily_fund_pnl < 0 else '' %}
       <div class="profit-extra">
-        <div>股票：<span class="{{ daily_stock_class }}">{{ '%.2f'|format(daily_stock_pnl) }} 元</span></div>
-        <div>基金：<span class="{{ daily_fund_class }}">{{ '%.2f'|format(daily_fund_pnl) }} 元</span></div>
+        <div>股票：<span class="{{ daily_stock_class }}">{{ money0(daily_stock_pnl) }} 元</span></div>
+        <div>基金：<span class="{{ daily_fund_class }}">{{ money0(daily_fund_pnl) }} 元</span></div>
       </div>
     </li>
   </ul>
@@ -104,7 +108,7 @@
       <tr>
         <th>维度</th>
         <th>周期交易盈亏</th>
-        <th>周期收益率</th>
+        <th>年化收益率</th>
         <th>持仓盈亏</th>
         <th>当日盈亏</th>
         <th>当前市值</th>
@@ -115,12 +119,12 @@
       {% for item in profit_summary_rows %}
         <tr class="{{ 'summary-total' if item.asset_type == 'total' else '' }}">
           <td>{{ item.label }}</td>
-          <td class="{{ 'profit-positive' if item.period_pnl > 0 else 'profit-negative' if item.period_pnl < 0 else '' }}">{{ '%.2f'|format(item.period_pnl) }}</td>
+          <td class="{{ 'profit-positive' if item.period_pnl > 0 else 'profit-negative' if item.period_pnl < 0 else '' }}">{{ money0(item.period_pnl) }}</td>
           <td class="{{ 'profit-positive' if item.period_ratio and item.period_ratio > 0 else 'profit-negative' if item.period_ratio and item.period_ratio < 0 else '' }}">{{ '-' if item.period_ratio is none else '%.2f'|format(item.period_ratio) ~ '%' }}</td>
-          <td class="{{ 'profit-positive' if item.unrealized > 0 else 'profit-negative' if item.unrealized < 0 else '' }}">{{ '%.2f'|format(item.unrealized) }}</td>
-          <td class="{{ 'profit-positive' if item.daily_pnl > 0 else 'profit-negative' if item.daily_pnl < 0 else '' }}">{{ '%.2f'|format(item.daily_pnl) }}</td>
-          <td>{{ '%.2f'|format(item.market_value) }}</td>
-          <td>{{ '%.2f'|format(item.cost_basis) }}</td>
+          <td class="{{ 'profit-positive' if item.unrealized > 0 else 'profit-negative' if item.unrealized < 0 else '' }}">{{ money0(item.unrealized) }}</td>
+          <td class="{{ 'profit-positive' if item.daily_pnl > 0 else 'profit-negative' if item.daily_pnl < 0 else '' }}">{{ money0(item.daily_pnl) }}</td>
+          <td>{{ money0(item.market_value) }}</td>
+          <td>{{ money0(item.cost_basis) }}</td>
         </tr>
       {% endfor %}
     </tbody>
@@ -145,11 +149,11 @@
             {% set change_class = 'profit-negative' %}
           {% endif %}
         {% endif %}
-        {% set market_value_text = '-' if pos.market_value is none else '%.2f'|format(pos.market_value) %}
+        {% set market_value_text = money0(pos.market_value) %}
         {% set unrealized_text = '-' %}
         {% set unrealized_class = '' %}
         {% if pos.unrealized is not none %}
-          {% set unrealized_text = '%.2f'|format(pos.unrealized) %}
+          {% set unrealized_text = money0(pos.unrealized) %}
           {% if pos.unrealized > 0 %}
             {% set unrealized_class = 'profit-positive' %}
           {% elif pos.unrealized < 0 %}
@@ -172,7 +176,7 @@
         {% set daily_text = '-' %}
         {% set daily_class = '' %}
         {% if pos.daily_change is not none %}
-          {% set daily_text = '%.2f'|format(pos.daily_change) %}
+          {% set daily_text = money0(pos.daily_change) %}
           {% if pos.daily_change > 0 %}
             {% set daily_class = 'profit-positive' %}
           {% elif pos.daily_change < 0 %}
