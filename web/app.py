@@ -2317,9 +2317,11 @@ def _calculate_period_pnl_by_nav(
             - data['period_start_value']
             - data['period_buy_cost']
         )
-    period_pnl = end_value - start_value - net_transfer
+    period_pnl = sum(data['period_pnl'] for data in by_asset.values())
+    account_value_change = end_value - start_value - net_transfer
     return {
         'period_pnl': period_pnl,
+        'account_value_change': account_value_change,
         'period_start_value': start_value,
         'period_end_value': end_value,
         'period_start_position_value': start_position_value,
@@ -2596,6 +2598,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'unrealized_ratio': unrealized_ratio,
         'period_start_value': period_performance['period_start_value'],
         'period_end_value': period_performance['period_end_value'],
+        'account_value_change': period_performance['account_value_change'],
         'period_buy_cost': period_performance['period_buy_cost'],
         'period_sell_proceeds': period_performance['period_sell_proceeds'],
         'period_dividend_income': period_performance['period_dividend_income'],
@@ -3430,6 +3433,7 @@ def portfolio_view():
         unrealized_ratio=context['unrealized_ratio'],
         period_start_value=context['period_start_value'],
         period_end_value=context['period_end_value'],
+        account_value_change=context['account_value_change'],
         period_buy_cost=context['period_buy_cost'],
         period_sell_proceeds=context['period_sell_proceeds'],
         period_dividend_income=context['period_dividend_income'],
@@ -3827,7 +3831,8 @@ def generate_rss_response(token: str):
 
         daily_ratio_txt = fmt_pct(snapshot.get('daily_ratio'))
         portfolio_desc = (
-            f"<p>周期盈亏：{fmt_currency(snapshot['period_pnl'])} 元</p>"
+            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元</p>"
+            f"<p>账户资产变动：{fmt_currency(snapshot['account_value_change'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
             f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元；比例：{daily_ratio_txt})</p>"
             f"<table style='{table_style}'>"

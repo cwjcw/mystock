@@ -4,7 +4,7 @@
   <div>
     <p class="eyebrow">Portfolio cockpit</p>
     <h2>盈亏概览与持仓</h2>
-    <p class="hero-subtitle">按总资产口径计算：期末总资产 - 期初总资产 - 净转入资金。</p>
+    <p class="hero-subtitle">按交易口径计算：期末持仓市值 + 卖出回款 + 分红 - 期初持仓市值 - 买入成本。</p>
   </div>
 </header>
 
@@ -46,10 +46,11 @@
   <ul class="profit-list">
     <li class="profit-item">
       <div class="profit-line">
-        <span class="profit-label">周期盈亏</span>
+        <span class="profit-label">周期交易盈亏</span>
         <span class="profit-value {{ 'profit-positive' if period_pnl > 0 else 'profit-negative' if period_pnl < 0 else '' }}">{{ '%.2f'|format(period_pnl) }} 元</span>
       </div>
       <div class="profit-extra">
+        <div>账户资产变动：{{ '%.2f'|format(account_value_change) }} 元</div>
         <div>期初总资产：{{ '%.2f'|format(period_start_value) }} 元</div>
         <div>期末总资产：{{ '%.2f'|format(period_end_value) }} 元</div>
         <div>净转入资金：{{ '%.2f'|format(period_net_transfer) }} 元</div>
@@ -91,7 +92,7 @@
     <thead>
       <tr>
         <th>维度</th>
-        <th>周期盈亏</th>
+        <th>周期交易盈亏</th>
         <th>持仓盈亏</th>
         <th>当日盈亏</th>
         <th>当前市值</th>
