@@ -2107,47 +2107,28 @@ def _trade_cash_until(rows, cutoff_date: dt.date) -> float:
     return total
 
 
-def _xirr(cash_flows: List[tuple[dt.date, float]]) -> Optional[float]:
-    flows = [(date, float(amount)) for date, amount in cash_flows if abs(float(amount)) > 1e-9]
-    if not flows:
-        return None
-    has_positive = any(amount > 0 for _date, amount in flows)
-    has_negative = any(amount < 0 for _date, amount in flows)
-    if not has_positive or not has_negative:
-        return None
-
-    base_date = min(date for date, _amount in flows)
-
-    def npv(rate: float) -> float:
-        total = 0.0
-        for date, amount in flows:
-            years = (date - base_date).days / 365.0
-            total += amount / ((1.0 + rate) ** years)
-        return total
-
-    low = -0.999999
-    high = 1.0
-    low_value = npv(low)
-    high_value = npv(high)
-    expand_count = 0
-    while low_value * high_value > 0 and expand_count < 80:
-        high = (high + 1.0) * 2.0 - 1.0
-        high_value = npv(high)
-        expand_count += 1
-    if low_value * high_value > 0:
-        return None
-
-    for _ in range(120):
-        mid = (low + high) / 2.0
-        mid_value = npv(mid)
-        if abs(mid_value) < 1e-7:
-            return mid
-        if low_value * mid_value <= 0:
-            high = mid
+def _modified_dietz_return(
+    start_value: float,
+    end_value: float,
+    flows: List[tuple[dt.date, float]],
+    start_date: dt.date,
+    end_date: dt.date,
+) -> Optional[float]:
+    total_days = max((end_date - start_date).days, 1)
+    net_flow = sum(amount for _date, amount in flows)
+    weighted_flow = 0.0
+    for flow_date, amount in flows:
+        if flow_date < start_date:
+            weight = 1.0
+        elif flow_date >= end_date:
+            weight = 0.0
         else:
-            low = mid
-            low_value = mid_value
-    return (low + high) / 2.0
+            weight = (end_date - flow_date).days / total_days
+        weighted_flow += amount * weight
+    denominator = start_value + weighted_flow
+    if abs(denominator) <= 1e-9:
+        return None
+    return (end_value - start_value - net_flow) / denominator
 
 
 def _account_cash_flow_sum(user_id: int, start_date: Optional[dt.date], end_date: dt.date) -> float:
@@ -2338,8 +2319,6 @@ def _calculate_period_pnl_by_nav(
         },
     }
     period_cash_flows: List[tuple[dt.date, float]] = []
-    if start_value > 1e-9:
-        period_cash_flows.append((previous_day, -start_value))
     for flow in _account_cash_flow_rows(user_id, start_date, end_date):
         flow_day = _parse_iso_date(flow.get('flow_date'))
         if not flow_day:
@@ -2350,10 +2329,7 @@ def _calculate_period_pnl_by_nav(
             continue
         if abs(transfer_amount) <= 1e-9:
             continue
-        period_cash_flows.append((flow_day, -transfer_amount))
-    for asset_data in by_asset.values():
-        if asset_data['period_start_value'] > 1e-9:
-            asset_data['cash_flows'].append((previous_day, -asset_data['period_start_value']))
+        period_cash_flows.append((flow_day, transfer_amount))
     for row in rows:
         trade_day = _parse_iso_date(row['trade_date'])
         if not trade_day or trade_day < start_date or trade_day > end_date:
@@ -2376,8 +2352,6 @@ def _calculate_period_pnl_by_nav(
                 'period_dividend_income': 0.0,
                 'cash_flows': [],
             }
-            if by_asset[asset_type]['period_start_value'] > 1e-9:
-                by_asset[asset_type]['cash_flows'].append((previous_day, -by_asset[asset_type]['period_start_value']))
         if row['action'] == 'buy':
             value = amount + fee + stamp_tax
             buy_cost += value
@@ -2393,11 +2367,6 @@ def _calculate_period_pnl_by_nav(
             dividend_income += value
             by_asset[asset_type]['period_dividend_income'] += value
             by_asset[asset_type]['cash_flows'].append((trade_day, value))
-    if end_value > 1e-9:
-        period_cash_flows.append((end_date, end_value))
-    for asset_data in by_asset.values():
-        if asset_data['period_end_value'] > 1e-9:
-            asset_data['cash_flows'].append((end_date, asset_data['period_end_value']))
     for data in by_asset.values():
         data['period_pnl'] = (
             data['period_end_value']
@@ -2408,13 +2377,19 @@ def _calculate_period_pnl_by_nav(
         )
         period_base = data['period_start_value'] + data['period_buy_cost']
         data['period_ratio_base'] = period_base
-        asset_xirr = _xirr(data['cash_flows'])
-        data['period_ratio'] = asset_xirr * 100 if asset_xirr is not None else None
+        asset_return = _modified_dietz_return(
+            data['period_start_value'],
+            data['period_end_value'],
+            [(_date, -amount) for _date, amount in data['cash_flows']],
+            previous_day,
+            end_date,
+        )
+        data['period_ratio'] = asset_return * 100 if asset_return is not None else None
         data.pop('cash_flows', None)
     period_pnl = sum(data['period_pnl'] for data in by_asset.values())
     period_ratio_base = start_value + cash_flow_totals['deposits']
-    period_xirr = _xirr(period_cash_flows)
-    period_ratio = period_xirr * 100 if period_xirr is not None else None
+    period_return = _modified_dietz_return(start_value, end_value, period_cash_flows, previous_day, end_date)
+    period_ratio = period_return * 100 if period_return is not None else None
     account_value_change = end_value - start_value - net_transfer
     return {
         'period_pnl': period_pnl,
@@ -3940,7 +3915,7 @@ def generate_rss_response(token: str):
         daily_ratio_txt = fmt_pct(snapshot.get('daily_ratio'))
         period_ratio_txt = fmt_pct(snapshot.get('period_ratio'))
         portfolio_desc = (
-            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元；资金加权收益率：{period_ratio_txt}</p>"
+            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元；资金加权周期收益率：{period_ratio_txt}</p>"
             f"<p>账户投入金额：{fmt_currency(snapshot['period_ratio_base'])} 元</p>"
             f"<p>账户资产变动：{fmt_currency(snapshot['account_value_change'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"

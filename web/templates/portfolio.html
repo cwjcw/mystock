@@ -62,7 +62,7 @@
         <span class="profit-label">周期交易盈亏</span>
         <span class="profit-value {{ 'profit-positive' if period_pnl > 0 else 'profit-negative' if period_pnl < 0 else '' }}">{{ money0(period_pnl) }} 元</span>
       </div>
-      <div class="profit-secondary">资金加权年化收益率：<span class="{{ period_ratio_class }}">{{ period_ratio_text }}</span></div>
+      <div class="profit-secondary">资金加权收益率：<span class="{{ period_ratio_class }}">{{ period_ratio_text }}</span></div>
       <div class="profit-extra">
         <div>账户投入金额：{{ money0(period_ratio_base) }} 元</div>
         <div>账户资产变动：{{ money0(account_value_change) }} 元</div>
@@ -108,7 +108,7 @@
       <tr>
         <th>维度</th>
         <th>周期交易盈亏</th>
-        <th>年化收益率</th>
+        <th>周期收益率</th>
         <th>持仓盈亏</th>
         <th>当日盈亏</th>
         <th>当前市值</th>
