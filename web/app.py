@@ -154,6 +154,13 @@ def _is_trading_day(date_obj: dt.date) -> bool:
 
 
 def get_db():
+    db = g.get('db')
+    if db is not None:
+        try:
+            db.ping(reconnect=True)
+            return db
+        except Exception:
+            close_db()
     if 'db' not in g:
         try:
             g.db = connect_mysql(APP_DB_DSN, cursorclass=DictCursor)
@@ -2317,10 +2324,15 @@ def _calculate_period_pnl_by_nav(
             - data['period_start_value']
             - data['period_buy_cost']
         )
+        period_base = data['period_start_value'] + data['period_buy_cost']
+        data['period_ratio'] = (data['period_pnl'] / period_base * 100) if abs(period_base) > 1e-9 else None
     period_pnl = sum(data['period_pnl'] for data in by_asset.values())
+    period_base = start_position_value + buy_cost
+    period_ratio = (period_pnl / period_base * 100) if abs(period_base) > 1e-9 else None
     account_value_change = end_value - start_value - net_transfer
     return {
         'period_pnl': period_pnl,
+        'period_ratio': period_ratio,
         'account_value_change': account_value_change,
         'period_start_value': start_value,
         'period_end_value': end_value,
@@ -2556,6 +2568,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
                 'asset_type': asset_key,
                 'label': label,
                 'period_pnl': period_values.get('period_pnl', 0.0),
+                'period_ratio': period_values.get('period_ratio'),
                 'unrealized': unrealized_value,
                 'daily_pnl': current_values.get('daily_pnl', 0.0),
                 'market_value': market_value,
@@ -2567,6 +2580,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
             'asset_type': 'total',
             'label': '合计',
             'period_pnl': period_pnl,
+            'period_ratio': period_performance.get('period_ratio'),
             'unrealized': sum(row['unrealized'] for row in profit_summary_rows),
             'daily_pnl': sum(row['daily_pnl'] for row in profit_summary_rows),
             'market_value': sum(row['market_value'] for row in profit_summary_rows),
@@ -2587,6 +2601,7 @@ def _get_portfolio_context(user_id: int, start_date: dt.date, end_date: dt.date)
         'realized_total': portfolio['realized_total'],
         'realized_all_time': portfolio['realized_all_time'],
         'period_pnl': period_pnl,
+        'period_ratio': period_performance['period_ratio'],
         'unrealized_total': unrealized_total,
         'total_market_value': total_market_value,
         'total_cost_basis': total_cost_basis,
@@ -3417,6 +3432,7 @@ def portfolio_view():
         positions=context['positions'],
         realized_total=context['realized_total'],
         period_pnl=context['period_pnl'],
+        period_ratio=context['period_ratio'],
         realized_items=context['realized_items'],
         realized_all_time=context['realized_all_time'],
         unrealized_total=context['unrealized_total'],
@@ -3830,8 +3846,9 @@ def generate_rss_response(token: str):
             )
 
         daily_ratio_txt = fmt_pct(snapshot.get('daily_ratio'))
+        period_ratio_txt = fmt_pct(snapshot.get('period_ratio'))
         portfolio_desc = (
-            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元</p>"
+            f"<p>周期交易盈亏：{fmt_currency(snapshot['period_pnl'])} 元；收益率：{period_ratio_txt}</p>"
             f"<p>账户资产变动：{fmt_currency(snapshot['account_value_change'])} 元</p>"
             f"<p>持仓盈亏：{fmt_currency(snapshot['unrealized_total'])} 元</p>"
             f"<p>当日盈亏：{fmt_currency(snapshot['daily_total'])} 元 (股票：{fmt_currency(snapshot['daily_stock_pnl'])} 元；基金：{fmt_currency(snapshot['daily_fund_pnl'])} 元；比例：{daily_ratio_txt})</p>"
