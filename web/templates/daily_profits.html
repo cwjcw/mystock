@@ -1,133 +1,194 @@
 {% extends 'layout.html' %}
 {% block content %}
-<h2>每日盈亏概览</h2>
-<form method="get" class="pnl-form range">
-  <label for="start">开始日期</label>
-  <input id="start" name="start" type="date" value="{{ start_date }}">
-  <label for="end">结束日期</label>
-  <input id="end" name="end" type="date" value="{{ end_date }}">
-  <div class="actions">
-    <button class="btn" type="submit">筛选</button>
+{% macro money0(value) -%}
+{{- '-' if value is none else '{:,.0f}'.format(value) -}}
+{%- endmacro %}
+{% macro ratio_text(value) -%}
+{{- '-' if value is none else '%.2f'|format(value) ~ '%' -}}
+{%- endmacro %}
+{% macro amount_class(value) -%}
+{{- 'profit-positive' if value and value > 0 else 'profit-negative' if value and value < 0 else '' -}}
+{%- endmacro %}
+
+<style>
+  .period-shell { display:grid; gap:1rem; }
+  .period-tabs { display:flex; gap:.65rem; justify-content:center; margin:.5rem 0 .25rem; }
+  .period-tab {
+    padding:.6rem 1.15rem;
+    border-radius:999px;
+    text-decoration:none;
+    color:var(--ink);
+    font-weight:800;
+    background:rgba(255,253,247,.65);
+    border:1px solid transparent;
+  }
+  .period-tab.active { color:var(--red); background:#fff; border-color:rgba(180,35,24,.15); box-shadow:0 10px 24px rgba(180,35,24,.08); }
+  .period-range-pill {
+    justify-self:center;
+    min-width:min(720px, 100%);
+    text-align:center;
+    padding:.7rem 1rem;
+    border-radius:999px;
+    background:#fff;
+    border:1px solid rgba(23,33,27,.06);
+    box-shadow:0 12px 32px rgba(23,33,27,.07);
+    font-weight:800;
+  }
+  .period-card { padding:1rem; border-radius:16px; background:#fff; border:1px solid rgba(23,33,27,.07); box-shadow:0 14px 38px rgba(23,33,27,.08); }
+  .period-card h3 { margin:.2rem 0 1rem; font-size:1.35rem; letter-spacing:-.03em; }
+  .calendar-toolbar { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:.85rem; }
+  .calendar-mode-label { color:var(--red); font-weight:900; padding:.45rem 1.4rem; border-radius:999px; background:rgba(180,35,24,.07); }
+  .calendar-title { color:var(--ink); font-weight:900; font-size:1.05rem; }
+  .calendar-grid { display:grid; grid-template-columns:repeat(7, minmax(0, 1fr)); gap:.25rem; max-width:760px; margin:0 auto; }
+  .calendar-weekday { text-align:center; color:rgba(23,33,27,.45); font-weight:800; font-size:.72rem; padding:.25rem 0; }
+  .calendar-cell {
+    min-height:4.25rem;
+    border-radius:.45rem;
+    padding:.38rem .25rem;
+    text-align:center;
+    background:rgba(23,33,27,.02);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:.3rem;
+  }
+  .calendar-cell.outside { opacity:.25; background:transparent; }
+  .calendar-cell.gain { background:rgba(180,35,24,.10); }
+  .calendar-cell.loss { background:rgba(20,107,74,.11); }
+  .calendar-day { font-size:1rem; font-weight:900; line-height:1; }
+  .calendar-amount { font-size:.68rem; font-weight:900; line-height:1.15; word-break:break-word; }
+  .calendar-rest { color:#c78343; font-size:.72rem; font-weight:800; }
+  .period-list { display:grid; gap:.55rem; }
+  .period-row {
+    display:grid;
+    grid-template-columns:1.2fr 1fr 1fr;
+    gap:.8rem;
+    align-items:center;
+    padding:.8rem .9rem;
+    border-radius:14px;
+    background:rgba(255,253,247,.8);
+    border:1px solid var(--line);
+  }
+  .period-row-label { font-weight:900; }
+  .period-row-range { display:block; margin-top:.16rem; color:var(--muted); font-size:.75rem; font-weight:700; }
+  .period-row-value { text-align:right; font-size:1.05rem; font-weight:900; }
+  .period-row-ratio { text-align:right; font-weight:900; }
+  @media (max-width: 760px) {
+    .period-tabs { justify-content:flex-start; overflow-x:auto; padding-bottom:.25rem; }
+    .calendar-cell { min-height:3.6rem; }
+    .calendar-day { font-size:.9rem; }
+    .calendar-amount { font-size:.58rem; }
+    .period-row { grid-template-columns:1fr; }
+    .period-row-value, .period-row-ratio { text-align:left; }
+  }
+</style>
+
+<header class="portfolio-hero">
+  <div>
+    <p class="eyebrow">Profit calendar</p>
+    <h2>周期盈亏</h2>
+    <p class="hero-subtitle">按持仓与盈亏页同一口径计算，收益率采用含现金的资金加权周期收益率。</p>
   </div>
-</form>
+</header>
 
-<section class="profit-overview">
-  <ul class="profit-list">
-    <li class="profit-item">
-      <div class="profit-line">
-        <span class="profit-label">盈亏合计</span>
-        {% set total_class = 'profit-positive' if total_amount > 0 else 'profit-negative' if total_amount < 0 else '' %}
-        <span class="profit-value profit-sm {{ total_class }}">{{ '{:,.0f}'.format(total_amount) if total_amount is not none else '-' }} 元</span>
-      </div>
-    </li>
-    <li class="profit-item">
-      <div class="profit-line">
-        <span class="profit-label">平均每天盈亏</span>
-        {% set avg_amount_class = 'profit-positive' if average_daily_amount and average_daily_amount > 0 else 'profit-negative' if average_daily_amount and average_daily_amount < 0 else '' %}
-        <span class="profit-value profit-sm {{ avg_amount_class }}">{{ '-' if average_daily_amount is none else '{:,.0f}'.format(average_daily_amount) }} 元</span>
-      </div>
-    </li>
-    <li class="profit-item">
-      <div class="profit-line">
-        <span class="profit-label">平均盈亏比例</span>
-        {% set avg_ratio_class = 'profit-positive' if average_ratio and average_ratio > 0 else 'profit-negative' if average_ratio and average_ratio < 0 else '' %}
-        <span class="profit-value profit-sm {{ avg_ratio_class }}">{{ '-' if average_ratio is none else '%.1f'|format(average_ratio) ~ '%' }}</span>
-      </div>
-    </li>
-  </ul>
-</section>
+<section class="period-shell">
+  <nav class="period-tabs">
+    <a class="period-tab {{ 'active' if mode == 'day' else '' }}" href="{{ url_for('daily_profits_view', mode='day', start=start_date, end=end_date) }}">按日</a>
+    <a class="period-tab {{ 'active' if mode == 'month' else '' }}" href="{{ url_for('daily_profits_view', mode='month', start=start_date, end=end_date) }}">按月</a>
+    <a class="period-tab {{ 'active' if mode == 'year' else '' }}" href="{{ url_for('daily_profits_view', mode='year', start=start_date, end=end_date) }}">按年</a>
+  </nav>
 
-<section>
-  <canvas id="profitChart" height="220"></canvas>
-</section>
+  <div class="period-range-pill">{{ period_label }}</div>
 
-<section class="positions" style="margin-top:1.5rem;">
-  <h3>每日盈亏明细</h3>
-  <div class="history">
-    <table class="history-table" border="1" cellpadding="6" cellspacing="0">
-      <thead>
-        <tr>
-          <th>日期</th>
-          <th>盈亏金额</th>
-          <th>盈亏比例</th>
-          <th>总市值</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for rec in records %}
-          {% set amount = rec.amount if rec.amount is not none else None %}
-          {% set ratio = rec.ratio if rec.ratio is not none else None %}
-          <tr>
-            <td>{{ rec.date }}</td>
-            <td class="{{ 'profit-positive' if amount and amount > 0 else 'profit-negative' if amount and amount < 0 else '' }}">{{ '-' if amount is none else '{:,.0f}'.format(amount) }}</td>
-            <td class="{{ 'profit-positive' if ratio and ratio > 0 else 'profit-negative' if ratio and ratio < 0 else '' }}">{{ '-' if ratio is none else '%.1f'|format(ratio) ~ '%' }}</td>
-            <td>{{ '-' if rec.total_market_value is none else '%.2f'|format(rec.total_market_value) }}</td>
-          </tr>
-        {% else %}
-          <tr>
-            <td colspan="4">暂无记录。</td>
-          </tr>
+  <form method="get" class="pnl-form range panel-card">
+    <input type="hidden" name="mode" value="{{ mode }}">
+    <div class="form-row">
+      <label for="start">开始日期</label>
+      <input id="start" name="start" type="date" value="{{ start_date }}">
+    </div>
+    <div class="form-row">
+      <label for="end">结束日期</label>
+      <input id="end" name="end" type="date" value="{{ end_date }}">
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">重新计算</button>
+    </div>
+  </form>
+
+  <section class="profit-overview">
+    <ul class="profit-list">
+      <li class="profit-item">
+        <div class="profit-line">
+          <span class="profit-label">周期盈亏</span>
+          <span class="profit-value {{ amount_class(total_amount) }}">{{ money0(total_amount) }} 元</span>
+        </div>
+        <div class="profit-extra">账户资产变动：{{ money0(account_value_change) }} 元</div>
+      </li>
+      <li class="profit-item">
+        <div class="profit-line">
+          <span class="profit-label">资金加权收益率</span>
+          <span class="profit-value profit-sm {{ amount_class(average_ratio) }}">{{ ratio_text(average_ratio) }}</span>
+        </div>
+        <div class="profit-extra">账户投入金额：{{ money0(input_amount) }} 元</div>
+      </li>
+      <li class="profit-item">
+        <div class="profit-line">
+          <span class="profit-label">平均每期盈亏</span>
+          <span class="profit-value profit-sm {{ amount_class(average_daily_amount) }}">{{ money0(average_daily_amount) }} 元</span>
+        </div>
+        <div class="profit-extra">当前拆分：{{ '按日' if mode == 'day' else '按月' if mode == 'month' else '按年' }}</div>
+      </li>
+    </ul>
+  </section>
+
+  {% if mode == 'day' and calendar_data %}
+    <section class="period-card">
+      <h3>收益日历</h3>
+      <div class="calendar-toolbar">
+        <span class="calendar-mode-label">按日</span>
+        <span class="calendar-title">{{ calendar_data.title }}</span>
+      </div>
+      <div class="calendar-grid">
+        {% for weekday in ['日','一','二','三','四','五','六'] %}
+          <div class="calendar-weekday">{{ weekday }}</div>
         {% endfor %}
-      </tbody>
-    </table>
-  </div>
+        {% for week in calendar_data.weeks %}
+          {% for day in week %}
+            {% set rec = day.record %}
+            {% set cls = 'gain' if rec and rec.amount > 0 else 'loss' if rec and rec.amount < 0 else '' %}
+            <div class="calendar-cell {{ cls }} {{ '' if day.in_month else 'outside' }}">
+              <div class="calendar-day">{{ day.day }}</div>
+              {% if rec %}
+                <div class="calendar-amount {{ amount_class(rec.amount) }}">{{ money0(rec.amount) }}</div>
+              {% elif day.in_month and day.is_weekend %}
+                <div class="calendar-rest">休</div>
+              {% endif %}
+            </div>
+          {% endfor %}
+        {% endfor %}
+      </div>
+    </section>
+  {% else %}
+    <section class="period-card">
+      <h3>{{ '月度盈亏' if mode == 'month' else '年度盈亏' }}</h3>
+      <div class="period-list">
+        {% for rec in records %}
+          <div class="period-row">
+            <div>
+              <span class="period-row-label">{{ rec.label }}</span>
+              <span class="period-row-range">{{ rec.start }} 至 {{ rec.end }}</span>
+            </div>
+            <div class="period-row-value {{ amount_class(rec.amount) }}">{{ money0(rec.amount) }} 元</div>
+            <div class="period-row-ratio {{ amount_class(rec.ratio) }}">{{ ratio_text(rec.ratio) }}</div>
+          </div>
+        {% else %}
+          <div class="empty">暂无记录。</div>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
 </section>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script>
-  const labels = {{ labels|tojson }};
-  const amounts = {{ amounts|tojson }};
-  const ratios = {{ ratios|tojson }};
-  const ctx = document.getElementById('profitChart').getContext('2d');
-  const chartData = {
-    labels,
-    datasets: [
-      {
-        label: '盈亏金额 (元)',
-        data: amounts,
-        borderColor: '#c62828',
-        backgroundColor: 'rgba(198, 40, 40, 0.15)',
-        yAxisID: 'y',
-        tension: 0.2,
-        fill: true
-      },
-      {
-        label: '盈亏比例 (%)',
-        data: ratios,
-        borderColor: '#1976d2',
-        backgroundColor: 'rgba(25, 118, 210, 0.15)',
-        yAxisID: 'y1',
-        tension: 0.2,
-        fill: false
-      }
-    ]
-  };
-  new Chart(ctx, {
-    type: 'line',
-    data: chartData,
-    options: {
-      responsive: true,
-      interaction: {
-        mode: 'index',
-        intersect: false
-      },
-      stacked: false,
-      scales: {
-        y: {
-          type: 'linear',
-          display: true,
-          position: 'left',
-          title: { display: true, text: '金额 (元)' }
-        },
-        y1: {
-          type: 'linear',
-          display: true,
-          position: 'right',
-          grid: { drawOnChartArea: false },
-          title: { display: true, text: '比例 (%)' }
-        }
-      }
-    }
-  });
-</script>
 {% endblock %}

@@ -7,6 +7,7 @@ import math
 import logging
 import json
 import re
+import calendar
 from functools import wraps
 from collections import defaultdict, deque
 from pathlib import Path
@@ -2075,6 +2076,29 @@ def _value_positions_at_date_by_asset(positions: Dict[str, dict], value_date: dt
     return totals
 
 
+def _value_positions_at_date_by_symbol(positions: Dict[str, dict], value_date: dt.date, latest_quotes: Dict[str, dict]) -> Dict[str, float]:
+    values: Dict[str, float] = {}
+    today = dt.datetime.now(CHINA_TZ).date()
+    for symbol, data in positions.items():
+        quantity = float(data.get('quantity') or 0.0)
+        if quantity <= 0:
+            continue
+        asset_type = data.get('asset_type') or 'stock'
+        price = None
+        if value_date >= today:
+            price = (latest_quotes.get(symbol) or {}).get('price')
+        if price is None and asset_type == 'stock':
+            price = _fetch_stock_close_on_or_before(symbol, value_date)
+        if price is None and asset_type == 'fund':
+            price = _fetch_fund_nav_on_or_before(symbol, value_date)
+        if price is None:
+            price = (latest_quotes.get(symbol) or {}).get('price')
+        if price is None:
+            continue
+        values[symbol] = quantity * float(price)
+    return values
+
+
 def _value_positions_at_date(positions: Dict[str, dict], value_date: dt.date, latest_quotes: Dict[str, dict]) -> float:
     return sum(_value_positions_at_date_by_asset(positions, value_date, latest_quotes).values())
 
@@ -2755,6 +2779,289 @@ def _start_daily_snapshot_worker() -> None:
     thread = threading.Thread(target=_worker, name='DailySnapshotWorker', daemon=True)
     thread.start()
     _DAILY_SNAPSHOT_THREAD_STARTED = True
+
+
+def _add_months(date_obj: dt.date, months: int) -> dt.date:
+    month_index = date_obj.month - 1 + months
+    year = date_obj.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(date_obj.day, calendar.monthrange(year, month)[1])
+    return dt.date(year, month, day)
+
+
+def _month_bounds(date_obj: dt.date) -> tuple[dt.date, dt.date]:
+    start = date_obj.replace(day=1)
+    end = date_obj.replace(day=calendar.monthrange(date_obj.year, date_obj.month)[1])
+    return start, end
+
+
+def _iter_profit_periods(mode: str, start_date: dt.date, end_date: dt.date) -> List[tuple[str, str, dt.date, dt.date]]:
+    periods: List[tuple[str, str, dt.date, dt.date]] = []
+    if mode == 'year':
+        year = start_date.year
+        while year <= end_date.year:
+            period_start = max(dt.date(year, 1, 1), start_date)
+            period_end = min(dt.date(year, 12, 31), end_date)
+            periods.append((str(year), f'{year}年', period_start, period_end))
+            year += 1
+        return periods
+    if mode == 'month':
+        current = start_date.replace(day=1)
+        while current <= end_date:
+            month_start, month_end = _month_bounds(current)
+            period_start = max(month_start, start_date)
+            period_end = min(month_end, end_date)
+            periods.append((current.strftime('%Y-%m'), current.strftime('%Y年%m月'), period_start, period_end))
+            current = _add_months(current, 1)
+        return periods
+
+    current = start_date
+    while current <= end_date:
+        periods.append((current.isoformat(), current.strftime('%m月%d日'), current, current))
+        current += dt.timedelta(days=1)
+    return periods
+
+
+def _load_user_trade_rows(user_id: int) -> List[Dict]:
+    return db_query_all(
+        'SELECT `trade_date`, `symbol`, `name`, `action`, `quantity`, `price`, `fee`, `stamp_tax`, `asset_type` '
+        'FROM `trade_logs` WHERE `user_id` = %s ORDER BY `trade_date` ASC, `id` ASC',
+        (user_id,),
+    )
+
+
+def _quotes_for_trade_rows(rows: List[Dict]) -> Dict[str, dict]:
+    symbol_asset: Dict[str, str] = {}
+    for row in rows:
+        asset = (row.get('asset_type') or 'stock')
+        symbol_asset[row['symbol']] = asset
+    return _fetch_quotes_for_symbols(list(symbol_asset.items())) if symbol_asset else {}
+
+
+def _period_profit_summary(
+    user_id: int,
+    rows: List[Dict],
+    quotes: Dict[str, dict],
+    start_date: dt.date,
+    end_date: dt.date,
+) -> Dict:
+    performance = _calculate_period_pnl_by_nav(user_id, rows, start_date, end_date, quotes)
+    return {
+        'period_pnl': float(performance.get('period_pnl') or 0.0),
+        'period_ratio': performance.get('period_ratio'),
+        'period_ratio_base': float(performance.get('period_ratio_base') or 0.0),
+        'account_value_change': float(performance.get('account_value_change') or 0.0),
+        'period_start_value': float(performance.get('period_start_value') or 0.0),
+        'period_end_value': float(performance.get('period_end_value') or 0.0),
+    }
+
+
+def _period_symbol_profit_rows(
+    rows: List[Dict],
+    quotes: Dict[str, dict],
+    start_date: dt.date,
+    end_date: dt.date,
+    name_cache: Optional[Dict[str, str]] = None,
+    asset_filter: str = 'stock',
+) -> List[Dict]:
+    name_cache = name_cache or {}
+    previous_day = start_date - dt.timedelta(days=1)
+    start_positions = _build_quantity_positions_until(rows, previous_day)
+    end_positions = _build_quantity_positions_until(rows, end_date)
+    start_values = _value_positions_at_date_by_symbol(start_positions, previous_day, quotes)
+    end_values = _value_positions_at_date_by_symbol(end_positions, end_date, quotes)
+
+    symbol_meta: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        symbol = row.get('symbol')
+        if not symbol:
+            continue
+        asset_type = row.get('asset_type') or 'stock'
+        if asset_filter != 'all' and asset_type != asset_filter:
+            continue
+        entry = symbol_meta.setdefault(symbol, {'name': '', 'asset_type': asset_type})
+        entry['asset_type'] = asset_type
+        name = (row.get('name') or '').strip()
+        if name:
+            entry['name'] = name
+
+    symbols = set(start_values) | set(end_values) | set(symbol_meta)
+    by_symbol: Dict[str, Dict] = {}
+    for row in rows:
+        trade_day = _parse_iso_date(row.get('trade_date'))
+        symbol = row.get('symbol')
+        if not symbol:
+            continue
+        name = (row.get('name') or '').strip()
+        asset_type = row.get('asset_type') or 'stock'
+        if asset_filter != 'all' and asset_type != asset_filter:
+            continue
+        quote = quotes.get(symbol) or {}
+        quote_name = (
+            quote.get('name')
+            or quote.get('f14')
+            or quote.get('short_name')
+            or quote.get('fund_name')
+            or ''
+        ).strip()
+        display_name = name or name_cache.get(symbol) or quote_name
+        if symbol in symbols:
+            entry = by_symbol.setdefault(
+                symbol,
+                {
+                    'symbol': symbol,
+                    'name': display_name,
+                    'asset_type': asset_type,
+                    'start_value': start_values.get(symbol, 0.0),
+                    'end_value': end_values.get(symbol, 0.0),
+                    'buy_cost': 0.0,
+                    'sell_proceeds': 0.0,
+                    'dividend_income': 0.0,
+                    'flows': [],
+                },
+            )
+            if display_name:
+                entry['name'] = display_name
+            entry['asset_type'] = asset_type
+        if not trade_day or trade_day < start_date or trade_day > end_date:
+            continue
+        try:
+            quantity = float(row.get('quantity') or 0.0)
+            price = float(row.get('price') or 0.0)
+            fee = float(row.get('fee') or 0.0)
+            stamp_tax = float(row.get('stamp_tax') or 0.0)
+        except (TypeError, ValueError):
+            continue
+        amount = quantity * price
+        entry = by_symbol.setdefault(
+            symbol,
+            {
+                'symbol': symbol,
+                'name': display_name,
+                'asset_type': asset_type,
+                'start_value': start_values.get(symbol, 0.0),
+                'end_value': end_values.get(symbol, 0.0),
+                'buy_cost': 0.0,
+                'sell_proceeds': 0.0,
+                'dividend_income': 0.0,
+                'flows': [],
+            },
+        )
+        if row.get('action') == 'buy':
+            value = amount + fee + stamp_tax
+            entry['buy_cost'] += value
+            entry['flows'].append((trade_day, value))
+        elif row.get('action') == 'sell':
+            value = amount - fee - stamp_tax
+            entry['sell_proceeds'] += value
+            entry['flows'].append((trade_day, -value))
+        elif row.get('action') == 'dividend':
+            value = amount - fee - stamp_tax
+            entry['dividend_income'] += value
+            entry['flows'].append((trade_day, -value))
+
+    for symbol in symbols:
+        meta = symbol_meta.get(symbol) or {}
+        asset_type = meta.get('asset_type') or (start_positions.get(symbol) or end_positions.get(symbol) or {}).get('asset_type', 'stock')
+        if asset_filter != 'all' and asset_type != asset_filter:
+            continue
+        quote = quotes.get(symbol) or {}
+        quote_name = (
+            quote.get('name')
+            or quote.get('f14')
+            or quote.get('short_name')
+            or quote.get('fund_name')
+            or ''
+        ).strip()
+        by_symbol.setdefault(
+            symbol,
+            {
+                'symbol': symbol,
+                'name': meta.get('name') or name_cache.get(symbol) or quote_name,
+                'asset_type': asset_type,
+                'start_value': start_values.get(symbol, 0.0),
+                'end_value': end_values.get(symbol, 0.0),
+                'buy_cost': 0.0,
+                'sell_proceeds': 0.0,
+                'dividend_income': 0.0,
+                'flows': [],
+            },
+        )
+
+    ranked = []
+    for item in by_symbol.values():
+        amount = item['end_value'] + item['sell_proceeds'] + item['dividend_income'] - item['start_value'] - item['buy_cost']
+        input_amount = item['start_value'] + item['buy_cost']
+        ratio = amount / input_amount * 100 if input_amount > 1e-9 else None
+        if item['symbol'] not in symbol_meta and abs(amount) <= 1e-9 and input_amount <= 1e-9 and item['end_value'] <= 1e-9:
+            continue
+        ranked.append(
+            {
+                'symbol': item['symbol'],
+                'name': item['name'] or item['symbol'],
+                'asset_type': item['asset_type'],
+                'amount': amount,
+                'ratio': ratio,
+                'input_amount': input_amount,
+                'end_value': item['end_value'],
+            }
+        )
+    ranked.sort(key=lambda item: item['amount'], reverse=True)
+    return ranked
+
+
+def _build_period_profit_records(
+    user_id: int,
+    rows: List[Dict],
+    quotes: Dict[str, dict],
+    mode: str,
+    start_date: dt.date,
+    end_date: dt.date,
+) -> List[Dict]:
+    records = []
+    for key, label, period_start, period_end in _iter_profit_periods(mode, start_date, end_date):
+        context = _period_profit_summary(user_id, rows, quotes, period_start, period_end)
+        ratio = context.get('period_ratio')
+        records.append(
+            {
+                'key': key,
+                'label': label,
+                'start': period_start.isoformat(),
+                'end': period_end.isoformat(),
+                'amount': float(context.get('period_pnl') or 0.0),
+                'ratio': float(ratio) if ratio is not None else None,
+                'account_value_change': float(context.get('account_value_change') or 0.0),
+                'start_value': float(context.get('period_start_value') or 0.0),
+                'end_value': float(context.get('period_end_value') or 0.0),
+                'input_amount': float(context.get('period_ratio_base') or 0.0),
+            }
+        )
+    return records
+
+
+def _build_month_calendar(records: List[Dict], anchor_date: dt.date) -> Dict:
+    month_start, month_end = _month_bounds(anchor_date)
+    record_map = {rec['key']: rec for rec in records}
+    first_weekday = (month_start.weekday() + 1) % 7
+    grid_start = month_start - dt.timedelta(days=first_weekday)
+    weeks = []
+    current = grid_start
+    for _week in range(6):
+        days = []
+        for _day in range(7):
+            key = current.isoformat()
+            days.append(
+                {
+                    'date': key,
+                    'day': current.day,
+                    'in_month': month_start <= current <= month_end,
+                    'is_weekend': current.weekday() >= 5,
+                    'record': record_map.get(key),
+                }
+            )
+            current += dt.timedelta(days=1)
+        weeks.append(days)
+    return {'title': anchor_date.strftime('%Y年%m月'), 'weeks': weeks}
 
 
 @app.route('/watchlist', methods=['GET', 'POST'])
@@ -3596,63 +3903,104 @@ def delete_cash_flow(flow_id: int):
 @login_required
 def daily_profits_view():
     today = dt.date.today()
-    default_start = today - dt.timedelta(days=29)
+    mode = (request.args.get('mode') or 'day').strip().lower()
+    if mode not in {'day', 'month', 'year'}:
+        mode = 'day'
+    if mode == 'year':
+        default_start = dt.date(today.year - 4, 1, 1)
+        default_end = today
+    elif mode == 'month':
+        default_start = dt.date(today.year, 1, 1)
+        default_end = today
+    else:
+        default_start, default_end = _month_bounds(today)
+        default_end = min(default_end, today)
+
     start_raw = request.args.get('start') or default_start.isoformat()
-    end_raw = request.args.get('end') or today.isoformat()
+    end_raw = request.args.get('end') or default_end.isoformat()
     start_date = _parse_iso_date(start_raw) or default_start
-    end_date = _parse_iso_date(end_raw) or today
+    end_date = _parse_iso_date(end_raw) or default_end
     if end_date < start_date:
         start_date, end_date = end_date, start_date
 
-    rows = db_query_all(
-        'SELECT `snapshot_date`, `amount`, `ratio`, `total_market_value` '
-        'FROM `daily_profit_snapshots` WHERE `user_id` = %s AND `snapshot_date` BETWEEN %s AND %s '
-        'ORDER BY `snapshot_date` ASC',
-        (current_user.id, start_date, end_date),
-    )
-
-    records = []
-    for row in rows:
-        snap_date = row['snapshot_date']
-        amount = row['amount']
-        ratio = row['ratio']
-        total_mv = row['total_market_value']
-        records.append(
-            {
-                'date': snap_date.isoformat() if hasattr(snap_date, 'isoformat') else str(snap_date),
-                'amount': float(amount) if amount is not None else None,
-                'ratio': float(ratio) if ratio is not None else None,
-                'total_market_value': float(total_mv) if total_mv is not None else None,
-            }
-        )
-
-    labels = [rec['date'] for rec in records]
-    chart_amounts = [rec['amount'] if rec['amount'] is not None else 0 for rec in records]
-    chart_ratios = [rec['ratio'] for rec in records]
-
-    amount_values = [rec['amount'] for rec in records if rec['amount'] is not None]
-    market_values = [rec['total_market_value'] for rec in records if rec['total_market_value'] is not None]
-    total_amount = sum(amount_values)
-    total_market_value = sum(market_values)
-    average_ratio = None
-    if total_market_value and abs(total_market_value) > 1e-9:
-        average_ratio = (total_amount / total_market_value) * 100
+    trade_rows = _load_user_trade_rows(current_user.id)
+    quotes = _quotes_for_trade_rows(trade_rows)
+    records = _build_period_profit_records(current_user.id, trade_rows, quotes, mode, start_date, end_date)
+    summary = _period_profit_summary(current_user.id, trade_rows, quotes, start_date, end_date)
+    total_amount = float(summary.get('period_pnl') or 0.0)
+    average_ratio = summary.get('period_ratio')
+    if average_ratio is not None:
+        average_ratio = float(average_ratio)
 
     average_daily_amount = None
-    if amount_values:
-        average_daily_amount = total_amount / len(amount_values)
+    if records:
+        average_daily_amount = total_amount / len(records)
+    calendar_data = _build_month_calendar(records, start_date) if mode == 'day' else None
+    period_label = f"{start_date.strftime('%Y.%m.%d')}-{end_date.strftime('%Y.%m.%d')}"
 
     return render_template(
         'daily_profits.html',
+        mode=mode,
         records=records,
-        labels=labels,
-        amounts=chart_amounts,
-        ratios=chart_ratios,
+        calendar_data=calendar_data,
         total_amount=total_amount,
         average_ratio=average_ratio,
         average_daily_amount=average_daily_amount,
+        period_label=period_label,
+        account_value_change=float(summary.get('account_value_change') or 0.0),
+        input_amount=float(summary.get('period_ratio_base') or 0.0),
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
+        today_str=today.isoformat(),
+    )
+
+
+@app.route('/stock_profits', methods=['GET'])
+@login_required
+def stock_profits_view():
+    today = dt.date.today()
+    default_start = dt.date(today.year, 1, 1)
+    default_end = today
+    start_raw = request.args.get('start') or default_start.isoformat()
+    end_raw = request.args.get('end') or default_end.isoformat()
+    start_date = _parse_iso_date(start_raw) or default_start
+    end_date = _parse_iso_date(end_raw) or default_end
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    try:
+        ranking_page = max(1, int(request.args.get('page') or 1))
+    except (TypeError, ValueError):
+        ranking_page = 1
+
+    trade_rows = _load_user_trade_rows(current_user.id)
+    quotes = _quotes_for_trade_rows(trade_rows)
+    trade_symbols = sorted({row.get('symbol') for row in trade_rows if row.get('symbol')})
+    name_cache = _watchlist_name_map(current_user.id, trade_symbols)
+    name_cache.update({key: value for key, value in _stock_code_name_map(trade_symbols).items() if value})
+    all_symbol_rankings = _period_symbol_profit_rows(
+        trade_rows,
+        quotes,
+        start_date,
+        end_date,
+        name_cache=name_cache,
+        asset_filter='stock',
+    )
+    page_size = 20
+    ranking_total = len(all_symbol_rankings)
+    ranking_pages = max(1, math.ceil(ranking_total / page_size))
+    ranking_page = min(ranking_page, ranking_pages)
+    ranking_start = (ranking_page - 1) * page_size
+    symbol_rankings = all_symbol_rankings[ranking_start:ranking_start + page_size]
+
+    return render_template(
+        'stock_profits.html',
+        symbol_rankings=symbol_rankings,
+        ranking_page=ranking_page,
+        ranking_pages=ranking_pages,
+        ranking_total=ranking_total,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        period_label=f"{start_date.strftime('%Y.%m.%d')}-{end_date.strftime('%Y.%m.%d')}",
     )
 
 

@@ -220,7 +220,7 @@
     <div class="container">
       <div class="nav">
         {% if current_user.is_authenticated %}
-          你好，{{ current_user.username }} | <a href="{{ url_for('watchlist_view') }}">我的股票</a> | <a href="{{ url_for('fund_overview_view') }}">我的基金</a> | <a href="{{ url_for('trades_view') }}">交易记录</a> | <a href="{{ url_for('cash_flows_view') }}">资金流水</a> | <a href="{{ url_for('portfolio_view') }}">持仓与盈亏</a> | <a href="{{ url_for('daily_profits_view') }}">每日盈亏</a>
+          你好，{{ current_user.username }} | <a href="{{ url_for('watchlist_view') }}">我的股票</a> | <a href="{{ url_for('fund_overview_view') }}">我的基金</a> | <a href="{{ url_for('trades_view') }}">交易记录</a> | <a href="{{ url_for('cash_flows_view') }}">资金流水</a> | <a href="{{ url_for('portfolio_view') }}">持仓与盈亏</a> | <a href="{{ url_for('daily_profits_view') }}">周期盈亏</a> | <a href="{{ url_for('stock_profits_view') }}">股票收益</a>
           {% if current_user.is_manager %}
             | <a href="{{ url_for('fund_manager_dashboard') }}">基金管理</a>
           {% endif %}

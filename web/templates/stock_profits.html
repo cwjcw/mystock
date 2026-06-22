@@ -1,0 +1,112 @@
+{% extends 'layout.html' %}
+{% block content %}
+{% macro money0(value) -%}
+{{- '-' if value is none else '{:,.0f}'.format(value) -}}
+{%- endmacro %}
+{% macro ratio_text(value) -%}
+{{- '-' if value is none else '%.2f'|format(value) ~ '%' -}}
+{%- endmacro %}
+{% macro amount_class(value) -%}
+{{- 'profit-positive' if value and value > 0 else 'profit-negative' if value and value < 0 else '' -}}
+{%- endmacro %}
+
+<style>
+  .stock-profit-shell { display:grid; gap:1rem; }
+  .period-range-pill {
+    justify-self:center;
+    min-width:min(720px, 100%);
+    text-align:center;
+    padding:.7rem 1rem;
+    border-radius:999px;
+    background:#fff;
+    border:1px solid rgba(23,33,27,.06);
+    box-shadow:0 12px 32px rgba(23,33,27,.07);
+    font-weight:800;
+  }
+  .period-card { padding:1rem; border-radius:16px; background:#fff; border:1px solid rgba(23,33,27,.07); box-shadow:0 14px 38px rgba(23,33,27,.08); }
+  .ranking-title-row { display:flex; justify-content:space-between; align-items:center; gap:1rem; margin-bottom:1rem; }
+  .ranking-title-row h3 { margin:0; font-size:1.35rem; letter-spacing:-.03em; }
+  .ranking-count { color:var(--muted); font-size:.82rem; font-weight:800; }
+  .ranking-header, .ranking-row {
+    display:grid;
+    grid-template-columns:1.35fr 1fr 1fr;
+    gap:.8rem;
+    align-items:center;
+  }
+  .ranking-header { color:var(--muted); font-weight:800; font-size:.82rem; padding:.2rem .25rem .6rem; }
+  .ranking-row { padding:.85rem .25rem; border-top:1px solid var(--line); }
+  .ranking-name { font-size:1rem; font-weight:900; }
+  .ranking-code { display:block; margin-top:.2rem; color:var(--muted); font-size:.78rem; font-weight:700; }
+  .asset-badge { display:inline-block; margin-left:.35rem; padding:.02rem .24rem; border:1px solid rgba(20,107,74,.25); border-radius:.3rem; color:var(--green); font-size:.68rem; }
+  .ranking-value, .ranking-ratio { text-align:right; font-size:1.15rem; font-weight:900; }
+  .ranking-pager { display:flex; align-items:center; justify-content:center; gap:.75rem; margin-top:1rem; color:var(--muted); font-weight:800; }
+  .ranking-pager a { color:var(--red); text-decoration:none; padding:.38rem .75rem; border-radius:999px; background:rgba(180,35,24,.08); }
+  @media (max-width: 760px) {
+    .ranking-title-row { display:grid; }
+    .ranking-header { display:none; }
+    .ranking-row { grid-template-columns:1fr; }
+    .ranking-value, .ranking-ratio { text-align:left; }
+  }
+</style>
+
+<header class="portfolio-hero">
+  <div>
+    <p class="eyebrow">Stock profits</p>
+    <h2>股票收益</h2>
+    <p class="hero-subtitle">按区间股票交易盈亏计算，收益率采用区间盈亏 /（期初市值 + 区间买入成本）。</p>
+  </div>
+</header>
+
+<section class="stock-profit-shell">
+  <div class="period-range-pill">{{ period_label }}</div>
+
+  <form method="get" class="pnl-form range panel-card">
+    <div class="form-row">
+      <label for="start">开始日期</label>
+      <input id="start" name="start" type="date" value="{{ start_date }}">
+    </div>
+    <div class="form-row">
+      <label for="end">结束日期</label>
+      <input id="end" name="end" type="date" value="{{ end_date }}">
+    </div>
+    <div class="actions">
+      <button class="btn" type="submit">重新计算</button>
+    </div>
+  </form>
+
+  <section class="period-card">
+    <div class="ranking-title-row">
+      <h3>股票收益榜单</h3>
+      <div class="ranking-count">共 {{ ranking_total }} 只，每页最多 20 只</div>
+    </div>
+    <div class="ranking-header">
+      <span>名称代码</span>
+      <span style="text-align:right;">区间收益</span>
+      <span style="text-align:right;">区间收益率</span>
+    </div>
+    {% for item in symbol_rankings %}
+      <div class="ranking-row">
+        <div>
+          <span class="ranking-name">{{ item.name }}</span>
+          <span class="ranking-code">{{ item.symbol }}<span class="asset-badge">股票</span></span>
+        </div>
+        <div class="ranking-value {{ amount_class(item.amount) }}">{{ money0(item.amount) }}</div>
+        <div class="ranking-ratio {{ amount_class(item.ratio) }}">{{ ratio_text(item.ratio) }}</div>
+      </div>
+    {% else %}
+      <div class="empty">暂无股票收益。</div>
+    {% endfor %}
+    {% if ranking_pages > 1 %}
+      <div class="ranking-pager">
+        {% if ranking_page > 1 %}
+          <a href="{{ url_for('stock_profits_view', start=start_date, end=end_date, page=ranking_page - 1) }}">上一页</a>
+        {% endif %}
+        <span>第 {{ ranking_page }} / {{ ranking_pages }} 页</span>
+        {% if ranking_page < ranking_pages %}
+          <a href="{{ url_for('stock_profits_view', start=start_date, end=end_date, page=ranking_page + 1) }}">下一页</a>
+        {% endif %}
+      </div>
+    {% endif %}
+  </section>
+</section>
+{% endblock %}
